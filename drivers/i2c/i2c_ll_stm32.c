@@ -445,12 +445,49 @@ static int i2c_stm32_init(const struct device *dev)
 
 #ifdef CONFIG_PM_DEVICE
 
+#if defined(CONFIG_SOC_SERIES_STM32WLX)
+static int i2c_stm32_reinit_timing(const struct device *dev)
+{
+	int ret;
+	const struct i2c_stm32_config *cfg = dev->config;
+	const struct device *const clk = DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE);
+	uint32_t i2c_clock = 0U;
+
+	if (IS_ENABLED(STM32_I2C_DOMAIN_CLOCK_SUPPORT) && (cfg->pclk_len > 1)) {
+		if (clock_control_get_rate(clk, (clock_control_subsys_t)&cfg->pclken[1],
+					&i2c_clock) < 0) {
+			LOG_ERR("Failed call clock_control_get_rate(pclken[1])");
+			return -EIO;
+		}
+	} else {
+		if (clock_control_get_rate(clk, (clock_control_subsys_t)&cfg->pclken[0],
+					&i2c_clock) < 0) {
+			LOG_ERR("Failed call clock_control_get_rate(pclken[0])");
+			return -EIO;
+		}
+	}
+
+#ifdef CONFIG_PM_DEVICE_RUNTIME
+	ret = clock_control_on(clk, (clock_control_subsys_t)&cfg->pclken[0]);
+	if (ret < 0) {
+		LOG_ERR("failure Enabling I2C clock");
+		return ret;
+	}
+#endif
+
+	ret = stm32_i2c_configure_timing(dev, i2c_clock);
+
+	return ret;
+}
+#endif
+
 static int i2c_stm32_pm_action(const struct device *dev, enum pm_device_action action)
 {
 	int err;
 
 	switch (action) {
 	case PM_DEVICE_ACTION_RESUME:
+		i2c_stm32_reinit_timing(dev);
 		err = i2c_stm32_activate(dev);
 		break;
 	case PM_DEVICE_ACTION_SUSPEND:
