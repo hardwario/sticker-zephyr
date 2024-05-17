@@ -156,6 +156,15 @@ Analog-to-Digital Converter (ADC)
 Bluetooth HCI
 =============
 
+ * The ``BT_HCI_VS_EXT`` Kconfig option was deleted and the feature is now included in the
+   :kconfig:option:`BT_HCI_VS` Kconfig option.
+ * The ``BT_HCI_VS_EVT`` Kconfig option was removed, since vendor event support is implicit if
+   the :kconfig:option:`BT_HCI_VS` option is enabled.
+ * The bt_read_static_addr() API was removed. This wasn't really a completely public API, but
+   since it was exposed by the public hci_driver.h header file the removal is mentioned here.
+   Enable the :kconfig:option:`BT_HCI_VS` Kconfig option instead, and use vendor specific HCI
+   commands API to get the Controller's Bluetooth static address when available.
+
 Charger
 =======
 
@@ -269,6 +278,14 @@ Serial
 Timer
 =====
 
+regulator
+=========
+
+* The :dtcompatible:`nxp,vref` driver no longer supports the ground selection function,
+  as this setting should not be modified by the user. The DT property ``nxp,ground-select``
+  has been removed, users should remove this property from their devicetree if it is present.
+  (:github:`70642`)
+
 Bluetooth
 *********
 
@@ -368,6 +385,13 @@ Networking
   redundant and confusing. Use ``CONFIG_NET_TCP_INIT_RETRANSMISSION_TIMEOUT`` and
   ``CONFIG_NET_TCP_RETRY_COUNT`` instead to control the total timeout at the
   TCP level. (:github:`70731`)
+
+* In LwM2M API, the callback type :c:type:`lwm2m_engine_set_data_cb_t` has now an additional
+  parameter ``offset``. This parameter is used to indicate the offset of the data
+  during a Coap Block-wise transfer. Any post write, validate or some firmware callbacks
+  should be updated to include this parameter. (:github:`72590`)
+
+
 
 Other Subsystems
 ****************

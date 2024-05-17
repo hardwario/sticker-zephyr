@@ -33,18 +33,6 @@
 		};
 	};
 
-	transceiver0: can-phy0 {
-		compatible = "microchip,mcp2562fd", "can-transceiver-gpio";
-		max-bitrate = <5000000>;
-		#phy-cells = <0>;
-	};
-
-	transceiver1: can-phy1 {
-		compatible = "microchip,mcp2562fd", "can-transceiver-gpio";
-		max-bitrate = <5000000>;
-		#phy-cells = <0>;
-	};
-
 	/* RM0455 - 23.6 External device address mapping */
 	sdram2: sdram@d0000000 {
 		compatible = "zephyr,memory-region", "mmio-sram";
@@ -214,22 +202,24 @@
 	status = "okay";
 	pinctrl-0 = <&fdcan1_tx_ph13 &fdcan1_rx_ph14>;
 	pinctrl-names = "default";
-	bus-speed = <125000>;
-	bus-speed-data = <1000000>;
 	sample-point = <875>;
 	sample-point-data = <875>;
-	phys = <&transceiver0>;
+
+	can-transceiver {
+		max-bitrate = <5000000>;
+	};
 };
 
 &fdcan2 {
 	status = "okay";
 	pinctrl-0 = <&fdcan2_tx_pb13 &fdcan2_rx_pb5>;
 	pinctrl-names = "default";
-	bus-speed = <125000>;
-	bus-speed-data = <1000000>;
 	sample-point = <875>;
 	sample-point-data = <875>;
-	phys = <&transceiver1>;
+
+	can-transceiver {
+		max-bitrate = <5000000>;
+	};
 };
 
 &fmc {

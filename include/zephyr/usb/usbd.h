@@ -169,6 +169,22 @@ struct usbd_status {
 	enum usbd_speed speed : 2;
 };
 
+struct usbd_contex;
+
+/**
+ * @brief Callback type definition for USB device message delivery
+ *
+ * The implementation uses the system workqueue, and a callback provided and
+ * registered by the application. The application callback is called in the
+ * context of the system workqueue. Notification messages are stored in a queue
+ * and delivered to the callback in sequence.
+ *
+ * @param[in] ctx Pointer to USB device support context
+ * @param[in] msg Pointer to USB device message
+ */
+typedef void (*usbd_msg_cb_t)(struct usbd_contex *const ctx,
+			      const struct usbd_msg *const msg);
+
 /**
  * USB device support runtime context
  *
@@ -682,20 +698,6 @@ int usbd_ep_clear_halt(struct usbd_contex *uds_ctx, uint8_t ep);
 bool usbd_ep_is_halted(struct usbd_contex *uds_ctx, uint8_t ep);
 
 /**
- * @brief Allocate buffer for USB device control request
- *
- * Allocate a new buffer from controller's driver buffer pool.
- *
- * @param[in] uds_ctx Pointer to USB device support context
- * @param[in] ep      Endpoint address
- * @param[in] size    Size of the request buffer
- *
- * @return pointer to allocated request or NULL on error.
- */
-struct net_buf *usbd_ep_ctrl_buf_alloc(struct usbd_contex *const uds_ctx,
-				       const uint8_t ep, const size_t size);
-
-/**
  * @brief Allocate buffer for USB device request
  *
  * Allocate a new buffer from controller's driver buffer pool.
@@ -882,6 +884,21 @@ int usbd_config_attrib_self(struct usbd_contex *const uds_ctx,
 int usbd_config_maxpower(struct usbd_contex *const uds_ctx,
 			 const enum usbd_speed speed,
 			 const uint8_t cfg, const uint8_t power);
+
+/**
+ * @brief Check that the controller can detect the VBUS state change.
+ *
+ * This can be used in a generic application to explicitly handle the VBUS
+ * detected event after usbd_init(). For example, to call usbd_enable() after a
+ * short delay to give the PMIC time to detect the bus, or to handle cases
+ * where usbd_enable() can only be called after a VBUS detected event.
+ *
+ * @param[in] uds_ctx Pointer to USB device support context
+ *
+ * @return true if controller can detect VBUS state change, false otherwise
+ */
+bool usbd_can_detect_vbus(struct usbd_contex *const uds_ctx);
+
 /**
  * @}
  */

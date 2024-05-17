@@ -5,7 +5,6 @@
 # Copyright 2022 NXP
 # SPDX-License-Identifier: Apache-2.0
 
-import csv
 import logging
 import math
 import os
@@ -75,7 +74,6 @@ class Handler:
         self.run = False
         self.type_str = type_str
 
-        self.binary = None
         self.pid_fn = None
         self.call_make_run = True
 
@@ -97,22 +95,6 @@ class Handler:
                          self.instance.platform.timeout_multiplier *
                          self.options.timeout_multiplier)
 
-    def record(self, harness):
-        if harness.recording:
-            if self.instance.recording is None:
-                self.instance.recording = harness.recording.copy()
-            else:
-                self.instance.recording.extend(harness.recording)
-
-            filename = os.path.join(self.build_dir, "recording.csv")
-            with open(filename, "at") as csvfile:
-                cw = csv.DictWriter(csvfile,
-                                    fieldnames = harness.recording[0].keys(),
-                                    lineterminator = os.linesep,
-                                    quoting = csv.QUOTE_NONNUMERIC)
-                cw.writeheader()
-                cw.writerows(harness.recording)
-
     def terminate(self, proc):
         terminate_process(proc)
         self.terminated = True
@@ -131,10 +113,12 @@ class Handler:
             return
         if not detected_suite_names:
             self._missing_suite_name(expected_suite_names, handler_time)
-        for detected_suite_name in detected_suite_names:
-            if detected_suite_name not in expected_suite_names:
+            return
+        # compare the expect and detect from end one by one without order
+        _d_suite = detected_suite_names[-len(expected_suite_names):]
+        if set(_d_suite) != set(expected_suite_names):
+            if not set(_d_suite).issubset(set(expected_suite_names)):
                 self._missing_suite_name(expected_suite_names, handler_time)
-                break
 
     def _missing_suite_name(self, expected_suite_names, handler_time):
         """
@@ -165,7 +149,20 @@ class Handler:
                 for tc in self.instance.testcases:
                     tc.status = "failed"
 
-        self.record(harness)
+        self.instance.record(harness.recording)
+
+    def get_default_domain_build_dir(self):
+        if self.instance.testsuite.sysbuild:
+            # Load domain yaml to get default domain build directory
+            # Note: for targets using QEMU, we assume that the target will
+            # have added any additional images to the run target manually
+            domain_path = os.path.join(self.build_dir, "domains.yaml")
+            domains = Domains.from_file(domain_path)
+            logger.debug("Loaded sysbuild domain data from %s" % domain_path)
+            build_dir = domains.get_default_domain().build_dir
+        else:
+            build_dir = self.build_dir
+        return build_dir
 
 
 class BinaryHandler(Handler):
@@ -238,8 +235,11 @@ class BinaryHandler(Handler):
             command = [self.generator_cmd, "run_renode_test"]
         elif self.call_make_run:
             command = [self.generator_cmd, "run"]
-        else:
+        elif self.instance.testsuite.type == "unit":
             command = [self.binary]
+        else:
+            binary = os.path.join(self.get_default_domain_build_dir(), "zephyr", "zephyr.exe")
+            command = [binary]
 
         if self.options.enable_valgrind:
             command = ["valgrind", "--error-exitcode=2",
@@ -344,7 +344,6 @@ class SimulationHandler(BinaryHandler):
             self.pid_fn = os.path.join(instance.build_dir, "renode.pid")
         elif type_str == 'native':
             self.call_make_run = False
-            self.binary = os.path.join(instance.build_dir, "zephyr", "zephyr.exe")
             self.ready = True
 
 
@@ -952,20 +951,6 @@ class QEMUHandler(Handler):
 
         QEMUHandler._thread_close_files(fifo_in, fifo_out, pid, out_fp, in_fp, log_out_fp)
 
-    def _get_sysbuild_build_dir(self):
-        if self.instance.testsuite.sysbuild:
-            # Load domain yaml to get default domain build directory
-            # Note: for targets using QEMU, we assume that the target will
-            # have added any additional images to the run target manually
-            domain_path = os.path.join(self.build_dir, "domains.yaml")
-            domains = Domains.from_file(domain_path)
-            logger.debug("Loaded sysbuild domain data from %s" % domain_path)
-            build_dir = domains.get_default_domain().build_dir
-        else:
-            build_dir = self.build_dir
-
-        return build_dir
-
     def _set_qemu_filenames(self, sysbuild_build_dir):
         # We pass this to QEMU which looks for fifos with .in and .out suffixes.
         # QEMU fifo will use main build dir
@@ -997,11 +982,11 @@ class QEMUHandler(Handler):
     def handle(self, harness):
         self.run = True
 
-        sysbuild_build_dir = self._get_sysbuild_build_dir()
+        domain_build_dir = self.get_default_domain_build_dir()
 
-        command = self._create_command(sysbuild_build_dir)
+        command = self._create_command(domain_build_dir)
 
-        self._set_qemu_filenames(sysbuild_build_dir)
+        self._set_qemu_filenames(domain_build_dir)
 
         self.thread = threading.Thread(name=self.name, target=QEMUHandler._thread,
                                        args=(self, self.get_test_timeout(), self.build_dir,
@@ -1140,20 +1125,6 @@ class QEMUWinHandler(Handler):
         else:
             handler.instance.status = out_state
             handler.instance.reason = "Unknown"
-
-    def _get_sysbuild_build_dir(self):
-        if self.instance.testsuite.sysbuild:
-            # Load domain yaml to get default domain build directory
-            # Note: for targets using QEMU, we assume that the target will
-            # have added any additional images to the run target manually
-            domain_path = os.path.join(self.build_dir, "domains.yaml")
-            domains = Domains.from_file(domain_path)
-            logger.debug("Loaded sysbuild domain data from %s" % domain_path)
-            build_dir = domains.get_default_domain().build_dir
-        else:
-            build_dir = self.build_dir
-
-        return build_dir
 
     def _set_qemu_filenames(self, sysbuild_build_dir):
         # PID file will be created in the main sysbuild app's build dir
@@ -1294,9 +1265,9 @@ class QEMUWinHandler(Handler):
     def handle(self, harness):
         self.run = True
 
-        sysbuild_build_dir = self._get_sysbuild_build_dir()
-        command = self._create_command(sysbuild_build_dir)
-        self._set_qemu_filenames(sysbuild_build_dir)
+        domain_build_dir = self.get_default_domain_build_dir()
+        command = self._create_command(domain_build_dir)
+        self._set_qemu_filenames(domain_build_dir)
 
         logger.debug("Running %s (%s)" % (self.name, self.type_str))
         is_timeout = False

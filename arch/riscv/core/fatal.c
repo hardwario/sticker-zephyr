@@ -81,13 +81,17 @@ static void unwind_stack(const z_arch_esf_t *esf)
 	uintptr_t ra;
 	struct stackframe *frame;
 
+	if (esf == NULL) {
+		return;
+	}
+
 	LOG_ERR("call trace:");
 
-	for (int i = 0; (i < MAX_STACK_FRAMES) && (fp != 0U) && in_stack_bound((uintptr_t)fp);) {
+	for (int i = 0; (i < MAX_STACK_FRAMES) && (fp != 0U) && in_stack_bound(fp);) {
 		frame = (struct stackframe *)fp - 1;
 		ra = frame->ra;
 		if (in_text_region(ra)) {
-			LOG_ERR("     %2d: fp: " PR_REG "   ra: " PR_REG, i, (uintptr_t)fp, ra);
+			LOG_ERR("     %2d: fp: " PR_REG "   ra: " PR_REG, i, fp, ra);
 			/*
 			 * Increment the iterator only if `ra` is within the text region to get the
 			 * most out of it
@@ -96,6 +100,8 @@ static void unwind_stack(const z_arch_esf_t *esf)
 		}
 		fp = frame->fp;
 	}
+
+	LOG_ERR("");
 }
 #endif /* CONFIG_RISCV_EXCEPTION_STACK_TRACE */
 
@@ -144,9 +150,6 @@ FUNC_NORETURN void z_riscv_fatal_error_csf(unsigned int reason, const z_arch_esf
 		LOG_ERR("   mepc: " PR_REG, esf->mepc);
 		LOG_ERR("mstatus: " PR_REG, esf->mstatus);
 		LOG_ERR("");
-#ifdef CONFIG_RISCV_EXCEPTION_STACK_TRACE
-		unwind_stack(esf);
-#endif /* CONFIG_RISCV_EXCEPTION_STACK_TRACE */
 	}
 
 	if (csf != NULL) {
@@ -163,6 +166,11 @@ FUNC_NORETURN void z_riscv_fatal_error_csf(unsigned int reason, const z_arch_esf
 #endif /* CONFIG_RISCV_ISA_RV32E */
 		LOG_ERR("");
 	}
+
+#ifdef CONFIG_RISCV_EXCEPTION_STACK_TRACE
+		unwind_stack(esf);
+#endif /* CONFIG_RISCV_EXCEPTION_STACK_TRACE */
+
 #endif /* CONFIG_EXCEPTION_DEBUG */
 	z_fatal_error(reason, esf);
 	CODE_UNREACHABLE;

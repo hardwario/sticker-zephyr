@@ -29,6 +29,8 @@ https://docs.zephyrproject.org/latest/security/vulnerabilities.html
 * CVE-2024-3077 `Zephyr project bug tracker GHSA-gmfv-4vfh-2mh8
   <https://github.com/zephyrproject-rtos/zephyr/security/advisories/GHSA-gmfv-4vfh-2mh8>`_
 
+* CVE-2024-4785: Under embargo until 2024-08-07
+
 API Changes
 ***********
 
@@ -78,6 +80,12 @@ Kernel
 
 Bluetooth
 *********
+* Audio
+
+  * Removed ``err`` from :c:struct:`bt_bap_broadcast_assistant_cb.recv_state_removed` as it was
+    redundant.
+
+* Host
 
   * Added Nordic UART Service (NUS), enabled by the :kconfig:option:`CONFIG_BT_ZEPHYR_NUS`.
     This Service exposes the ability to declare multiple instances of the GATT service,
@@ -101,6 +109,8 @@ Boards & SoC Support
 * Made these changes for RISC-V boards:
 
 * Made these changes for native/POSIX boards:
+
+  * Introduced the simulated :ref:`nrf54l15bsim<nrf54l15bsim>` target.
 
   * LLVM fuzzing support has been refactored while adding support for it in native_sim.
 
@@ -280,6 +290,9 @@ Networking
   * Added new API function:
 
     * :c:func:`lwm2m_set_bulk`
+
+  * Added new ``offset`` parameter to :c:type:`lwm2m_engine_set_data_cb_t` callback type.
+    This affects post write and validate callbacks as well as some firmware callbacks.
 
 * IPSP:
 
