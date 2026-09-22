@@ -52,6 +52,11 @@
 /* Use version 1.0.3.0 for ABP */
 #define LORAWAN_ABP_VERSION 0x01000300
 
+/* Bounded wait for the MLME/MCPS confirm of a join or send request */
+#define LORAWAN_CONFIRM_TIMEOUT                                                        \
+	(CONFIG_LORAWAN_CONFIRM_TIMEOUT_MS == 0 ? K_FOREVER                            \
+						: K_MSEC(CONFIG_LORAWAN_CONFIRM_TIMEOUT_MS))
+
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(lorawan, CONFIG_LORAWAN_LOG_LEVEL);
 
@@ -494,11 +499,15 @@ int lorawan_join(const struct lorawan_join_config *join_cfg)
 		LOG_DBG("Network join request sent!");
 
 		/*
-		 * We can be sure that the semaphore will be released for
-		 * both success and failure cases after a specific time period.
-		 * So we can use K_FOREVER and no need to check the return val.
+		 * LoRaMac reports the join result (success or failure) once the
+		 * RX windows have closed. Bound the wait anyway, so a lost
+		 * confirm cannot block the calling thread forever.
 		 */
-		k_sem_take(&mlme_confirm_sem, K_FOREVER);
+		if (k_sem_take(&mlme_confirm_sem, LORAWAN_CONFIRM_TIMEOUT) != 0) {
+			LOG_ERR("Join confirm timeout");
+			ret = -ETIMEDOUT;
+			goto out;
+		}
 		if (last_mlme_confirm_status != LORAMAC_EVENT_INFO_STATUS_OK) {
 			ret = lorawan_eventinfo2errno(last_mlme_confirm_status);
 			goto out;
@@ -720,6 +729,8 @@ int lorawan_send(uint8_t port, uint8_t *data, uint8_t len,
 		mcps_req.Req.Unconfirmed.Datarate = current_datarate;
 	}
 
+	/* Drop a confirm left over from an earlier send whose wait timed out */
+	k_sem_reset(&mcps_confirm_sem);
 	status = LoRaMacMcpsRequest(&mcps_req);
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("LoRaWAN Send failed: %s", lorawan_status2str(status));
@@ -728,12 +739,16 @@ int lorawan_send(uint8_t port, uint8_t *data, uint8_t len,
 	}
 
 	/*
-	 * Always wait for MAC operations to complete.
-	 * We can be sure that the semaphore will be released for
-	 * both success and failure cases after a specific time period.
-	 * So we can use K_FOREVER and no need to check the return val.
+	 * Always wait for MAC operations to complete. LoRaMac reports both
+	 * success and failure once the transmission's RX windows have
+	 * closed; the bound only guards against a confirm that never comes
+	 * (which previously blocked the calling thread forever).
 	 */
-	k_sem_take(&mcps_confirm_sem, K_FOREVER);
+	if (k_sem_take(&mcps_confirm_sem, LORAWAN_CONFIRM_TIMEOUT) != 0) {
+		LOG_ERR("McpsConfirm timeout");
+		ret = -ETIMEDOUT;
+		goto out;
+	}
 	if (last_mcps_confirm_status != LORAMAC_EVENT_INFO_STATUS_OK) {
 		ret = lorawan_eventinfo2errno(last_mcps_confirm_status);
 	}

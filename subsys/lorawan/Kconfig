@@ -37,6 +37,22 @@ config LORAWAN_SYSTEM_MAX_RX_ERROR
 	  System Max Rx timing error value in ms to be used by LoRaWAN stack
 	  for calculating the RX1/RX2 window timing.
 
+config LORAWAN_CONFIRM_TIMEOUT_MS
+	int "Maximum wait for a MAC confirm in lorawan_join()/lorawan_send() [ms]"
+	default 20000
+	range 0 3600000
+	help
+	  Upper bound on how long lorawan_join() and lorawan_send() wait for
+	  the LoRaMac MLME/MCPS confirm after the request has been accepted.
+	  LoRaMac normally reports it once the RX windows of the (last)
+	  transmission have closed, i.e. within a few seconds for a class A
+	  join or unconfirmed uplink. Retransmissions (NbTrans > 1, confirmed
+	  uplinks) and duty-cycle delays can stretch that, so keep the value
+	  above the longest wait the application legitimately expects.
+	  If the confirm never arrives (e.g. a lost radio event), the call
+	  returns -ETIMEDOUT instead of blocking the calling thread forever.
+	  0 waits forever (the previous behaviour).
+
 config LORAWAN_PUBLIC_NETWORK
 	bool "LoRaWAN Public Network"
 	default y
