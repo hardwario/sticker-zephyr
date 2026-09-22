@@ -117,7 +117,9 @@ static uint8_t get_battery_level(void)
 
 static void mac_process_notify(void)
 {
+	lorawan_mac_lock();
 	LoRaMacProcess();
+	lorawan_mac_unlock();
 }
 
 static void datarate_observe(bool force_notification)
@@ -125,7 +127,9 @@ static void datarate_observe(bool force_notification)
 	MibRequestConfirm_t mib_req;
 
 	mib_req.Type = MIB_CHANNELS_DATARATE;
+	lorawan_mac_lock();
 	LoRaMacMibGetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
 
 	if ((mib_req.Param.ChannelsDatarate != current_datarate) ||
 	    (force_notification)) {
@@ -422,7 +426,9 @@ int lorawan_request_link_check(bool force_request)
 	MlmeReq_t mlme_req;
 
 	mlme_req.Type = MLME_LINK_CHECK;
+	lorawan_mac_lock();
 	status = LoRaMacMlmeRequest(&mlme_req);
+	lorawan_mac_unlock();
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("LinkCheckReq failed: %s", lorawan_status2str(status));
 		ret = lorawan_status2errno(status);
@@ -443,7 +449,9 @@ int lorawan_request_device_time(bool force_request)
 	MlmeReq_t mlme_req;
 
 	mlme_req.Type = MLME_DEVICE_TIME;
+	lorawan_mac_lock();
 	status = LoRaMacMlmeRequest(&mlme_req);
+	lorawan_mac_unlock();
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("DeviceTime Req. failed: %s", lorawan_status2str(status));
 		ret = lorawan_status2errno(status);
@@ -467,7 +475,9 @@ int lorawan_device_time_get(uint32_t *gps_time)
 		return -EAGAIN;
 	}
 
+	lorawan_mac_lock();
 	local_time = SysTimeGet();
+	lorawan_mac_unlock();
 	*gps_time = local_time.Seconds - UNIX_GPS_EPOCH_OFFSET;
 	return 0;
 }
@@ -479,6 +489,7 @@ int lorawan_join(const struct lorawan_join_config *join_cfg)
 	int ret = 0;
 
 	k_mutex_lock(&lorawan_join_mutex, K_FOREVER);
+	lorawan_mac_lock();
 
 	/* MIB_PUBLIC_NETWORK powers on the radio and does not turn it off */
 	mib_req.Type = MIB_PUBLIC_NETWORK;
@@ -489,6 +500,8 @@ int lorawan_join(const struct lorawan_join_config *join_cfg)
 		/* Drop a confirm left over from an earlier join whose wait ended */
 		k_sem_reset(&mlme_confirm_sem);
 		status = lorawan_join_otaa(join_cfg);
+		/* The confirm is delivered under the MAC lock: release it first */
+		lorawan_mac_unlock();
 		if (status != LORAMAC_STATUS_OK) {
 			LOG_ERR("OTAA join failed: %s",
 				lorawan_status2str(status));
@@ -514,6 +527,7 @@ int lorawan_join(const struct lorawan_join_config *join_cfg)
 		}
 	} else if (join_cfg->mode == LORAWAN_ACT_ABP) {
 		status = lorawan_join_abp(join_cfg);
+		lorawan_mac_unlock();
 		if (status != LORAMAC_STATUS_OK) {
 			LOG_ERR("ABP join failed: %s",
 				lorawan_status2str(status));
@@ -521,6 +535,7 @@ int lorawan_join(const struct lorawan_join_config *join_cfg)
 			goto out;
 		}
 	} else {
+		lorawan_mac_unlock();
 		ret = -EINVAL;
 	}
 
@@ -541,7 +556,9 @@ out:
 
 			mib_req2.Type = MIB_CHANNELS_DATARATE;
 			mib_req2.Param.ChannelsDatarate = default_datarate;
+			lorawan_mac_lock();
 			LoRaMacMibSetRequestConfirm(&mib_req2);
+			lorawan_mac_unlock();
 		}
 
 		/*
@@ -562,7 +579,9 @@ int lorawan_set_class(enum lorawan_class dev_class)
 	LoRaMacStatus_t status;
 
 	mib_req.Type = MIB_DEVICE_CLASS;
+	lorawan_mac_lock();
 	LoRaMacMibGetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
 	current_class = mib_req.Param.Class;
 
 	switch (dev_class) {
@@ -580,7 +599,9 @@ int lorawan_set_class(enum lorawan_class dev_class)
 	}
 
 	if (mib_req.Param.Class != current_class) {
+		lorawan_mac_lock();
 		status = LoRaMacMibSetRequestConfirm(&mib_req);
+		lorawan_mac_unlock();
 		if (status != LORAMAC_STATUS_OK) {
 			LOG_ERR("Failed to set device class: %s",
 				lorawan_status2str(status));
@@ -594,6 +615,7 @@ int lorawan_set_class(enum lorawan_class dev_class)
 int lorawan_set_channels_mask(uint16_t *channels_mask, size_t channels_mask_size)
 {
 	MibRequestConfirm_t mib_req;
+	LoRaMacStatus_t status;
 
 	if ((channels_mask == NULL) || (channels_mask_size != region_channels_mask_size)) {
 		return -EINVAL;
@@ -603,7 +625,10 @@ int lorawan_set_channels_mask(uint16_t *channels_mask, size_t channels_mask_size
 	mib_req.Type = MIB_CHANNELS_MASK;
 	mib_req.Param.ChannelsMask = channels_mask;
 
-	if (LoRaMacMibSetRequestConfirm(&mib_req) != LORAMAC_STATUS_OK) {
+	lorawan_mac_lock();
+	status = LoRaMacMibSetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
+	if (status != LORAMAC_STATUS_OK) {
 		/* Channels mask is invalid for this region. */
 		return -EINVAL;
 	}
@@ -614,6 +639,7 @@ int lorawan_set_channels_mask(uint16_t *channels_mask, size_t channels_mask_size
 int lorawan_set_datarate(enum lorawan_datarate dr)
 {
 	MibRequestConfirm_t mib_req;
+	LoRaMacStatus_t status;
 
 	/* Bail out if using ADR */
 	if (atomic_test_bit(lorawan_flags, LORAWAN_FLAG_ADR_ENABLE)) {
@@ -623,7 +649,10 @@ int lorawan_set_datarate(enum lorawan_datarate dr)
 	/* Notify MAC layer of the requested datarate */
 	mib_req.Type = MIB_CHANNELS_DATARATE;
 	mib_req.Param.ChannelsDatarate = dr;
-	if (LoRaMacMibSetRequestConfirm(&mib_req) != LORAMAC_STATUS_OK) {
+	lorawan_mac_lock();
+	status = LoRaMacMibSetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
+	if (status != LORAMAC_STATUS_OK) {
 		/* Datarate is invalid for this region */
 		return -EINVAL;
 	}
@@ -640,7 +669,9 @@ void lorawan_get_payload_sizes(uint8_t *max_next_payload_size,
 	LoRaMacTxInfo_t tx_info;
 
 	/* QueryTxPossible cannot fail */
+	lorawan_mac_lock();
 	(void) LoRaMacQueryTxPossible(0, &tx_info);
+	lorawan_mac_unlock();
 
 	*max_next_payload_size = tx_info.MaxPossibleApplicationDataSize;
 	*max_payload_size = tx_info.CurrentPossiblePayloadSize;
@@ -651,7 +682,9 @@ enum lorawan_datarate lorawan_get_min_datarate(void)
 	MibRequestConfirm_t mib_req;
 
 	mib_req.Type = MIB_CHANNELS_MIN_TX_DATARATE;
+	lorawan_mac_lock();
 	LoRaMacMibGetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
 
 	return mib_req.Param.ChannelsMinTxDatarate;
 }
@@ -665,17 +698,23 @@ void lorawan_enable_adr(bool enable)
 
 		mib_req.Type = MIB_ADR;
 		mib_req.Param.AdrEnable = atomic_test_bit(lorawan_flags, LORAWAN_FLAG_ADR_ENABLE);
+		lorawan_mac_lock();
 		LoRaMacMibSetRequestConfirm(&mib_req);
+		lorawan_mac_unlock();
 	}
 }
 
 int lorawan_set_conf_msg_tries(uint8_t tries)
 {
 	MibRequestConfirm_t mib_req;
+	LoRaMacStatus_t status;
 
 	mib_req.Type = MIB_CHANNELS_NB_TRANS;
 	mib_req.Param.ChannelsNbTrans = tries;
-	if (LoRaMacMibSetRequestConfirm(&mib_req) != LORAMAC_STATUS_OK) {
+	lorawan_mac_lock();
+	status = LoRaMacMibSetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
+	if (status != LORAMAC_STATUS_OK) {
 		return -EINVAL;
 	}
 
@@ -696,6 +735,7 @@ int lorawan_send(uint8_t port, uint8_t *data, uint8_t len,
 	}
 
 	k_mutex_lock(&lorawan_send_mutex, K_FOREVER);
+	lorawan_mac_lock();
 
 	status = LoRaMacQueryTxPossible(len, &tx_info);
 	if (status != LORAMAC_STATUS_OK) {
@@ -732,6 +772,8 @@ int lorawan_send(uint8_t port, uint8_t *data, uint8_t len,
 	/* Drop a confirm left over from an earlier send whose wait timed out */
 	k_sem_reset(&mcps_confirm_sem);
 	status = LoRaMacMcpsRequest(&mcps_req);
+	/* The confirm is delivered under the MAC lock: release it first */
+	lorawan_mac_unlock();
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("LoRaWAN Send failed: %s", lorawan_status2str(status));
 		ret = lorawan_status2errno(status);
@@ -793,11 +835,14 @@ int lorawan_start(void)
 	GetPhyParams_t phy_params;
 	PhyParam_t phy_param;
 
+	lorawan_mac_lock();
+
 	status = LoRaMacInitialization(&mac_primitives, &mac_callbacks,
 				       selected_region);
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("LoRaMacInitialization failed: %s",
 			lorawan_status2str(status));
+		lorawan_mac_unlock();
 		return -EINVAL;
 	}
 
@@ -812,6 +857,7 @@ int lorawan_start(void)
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("Failed to start the LoRaMAC stack: %s",
 			lorawan_status2str(status));
+		lorawan_mac_unlock();
 		return -EINVAL;
 	}
 
@@ -825,6 +871,8 @@ int lorawan_start(void)
 	mib_req.Type = MIB_SYSTEM_MAX_RX_ERROR;
 	mib_req.Param.SystemMaxRxError = CONFIG_LORAWAN_SYSTEM_MAX_RX_ERROR;
 	LoRaMacMibSetRequestConfirm(&mib_req);
+
+	lorawan_mac_unlock();
 
 	return 0;
 }

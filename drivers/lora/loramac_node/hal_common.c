@@ -5,6 +5,7 @@
  */
 
 #include <zephyr/kernel.h>
+#include <zephyr/lorawan/lorawan.h>
 
 #include <timer.h>
 
@@ -15,9 +16,29 @@ static uint32_t saved_time;
 /* TODO: Use Non-volatile memory for backup */
 static volatile uint32_t backup_reg[2];
 
+/*
+ * One recursive lock for every entry into LoRaMac, see lorawan_mac_lock().
+ * Defined here rather than in the LoRaWAN subsystem so that the radio and
+ * timer glue can take it in every build that uses the loramac-node HAL.
+ */
+static K_MUTEX_DEFINE(loramac_mutex);
+
+void lorawan_mac_lock(void)
+{
+	k_mutex_lock(&loramac_mutex, K_FOREVER);
+}
+
+void lorawan_mac_unlock(void)
+{
+	k_mutex_unlock(&loramac_mutex);
+}
+
 static void timer_work_handler(struct k_work *work)
 {
+	/* Timer events run LoRaMac code */
+	lorawan_mac_lock();
 	TimerIrqHandler();
+	lorawan_mac_unlock();
 }
 
 static void timer_callback(struct k_timer *_timer)

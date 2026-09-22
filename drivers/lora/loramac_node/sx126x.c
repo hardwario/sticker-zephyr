@@ -9,6 +9,7 @@
 #include <zephyr/drivers/lora.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/kernel.h>
+#include <zephyr/lorawan/lorawan.h>
 
 #include <sx126x/sx126x.h>
 
@@ -417,6 +418,9 @@ static void sx126x_dio1_irq_work_handler(struct k_work *work)
 		return;
 	}
 
+	/* Radio events run LoRaMac code, see lorawan_mac_lock() */
+	lorawan_mac_lock();
+
 	dev_data.radio_dio_irq(NULL);
 	if (Radio.IrqProcess) {
 		Radio.IrqProcess();
@@ -426,6 +430,8 @@ static void sx126x_dio1_irq_work_handler(struct k_work *work)
 	if (dev_data.mode != MODE_SLEEP) {
 		sx126x_dio1_irq_enable(&dev_data);
 	}
+
+	lorawan_mac_unlock();
 }
 
 static int sx126x_lora_init(const struct device *dev)

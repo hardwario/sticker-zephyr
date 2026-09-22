@@ -516,6 +516,28 @@ void lorawan_frag_transport_register_descriptor_callback(transport_descriptor_cb
  */
 int lorawan_frag_transport_run(void (*transport_finished_cb)(void));
 
+/**
+ * @brief Take the lock that serialises all access to the LoRaMac stack.
+ *
+ * LoRaMac-node is not thread-safe: requests come from application threads
+ * through this API, while its timer and radio events are processed on the
+ * system work queue. Every entry into the MAC therefore runs under one
+ * recursive lock. The LoRaWAN API and the loramac-node radio/timer glue take
+ * it internally; an application that calls LoRaMac functions directly (MIB
+ * get/set, LoRaMacIsBusy(), ...) must hold it around those calls as well.
+ *
+ * Never hold the lock while waiting for a MAC event (confirm, downlink): the
+ * event is delivered from a context that needs the lock.
+ *
+ * @note HARDWARIO sticker-zephyr extension (hardwario/sticker-firmware#241).
+ */
+void lorawan_mac_lock(void);
+
+/**
+ * @brief Release the lock taken by lorawan_mac_lock().
+ */
+void lorawan_mac_unlock(void);
+
 #ifdef __cplusplus
 }
 #endif
