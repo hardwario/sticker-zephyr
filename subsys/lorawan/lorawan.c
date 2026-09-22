@@ -227,8 +227,16 @@ static void mlme_confirm_handler(MlmeConfirm_t *mlme_confirm)
 	}
 
 out_sem:
-	last_mlme_confirm_status = mlme_confirm->Status;
-	k_sem_give(&mlme_confirm_sem);
+	/*
+	 * Only lorawan_join() waits for an MLME confirm. Link check and device
+	 * time requests are fire-and-forget, so signalling their confirms would
+	 * leave a stale token (and a stale status) in mlme_confirm_sem and make
+	 * the next lorawan_join() return immediately with the wrong result.
+	 */
+	if (mlme_confirm->MlmeRequest == MLME_JOIN) {
+		last_mlme_confirm_status = mlme_confirm->Status;
+		k_sem_give(&mlme_confirm_sem);
+	}
 }
 
 static void mlme_indication_handler(MlmeIndication_t *mlme_indication)
@@ -473,6 +481,8 @@ int lorawan_join(const struct lorawan_join_config *join_cfg)
 	LoRaMacMibSetRequestConfirm(&mib_req);
 
 	if (join_cfg->mode == LORAWAN_ACT_OTAA) {
+		/* Drop a confirm left over from an earlier join whose wait ended */
+		k_sem_reset(&mlme_confirm_sem);
 		status = lorawan_join_otaa(join_cfg);
 		if (status != LORAMAC_STATUS_OK) {
 			LOG_ERR("OTAA join failed: %s",
