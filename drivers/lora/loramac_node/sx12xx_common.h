@@ -38,6 +38,13 @@ int sx12xx_lora_test_cw(const struct device *dev, uint32_t frequency,
 			int8_t tx_power,
 			uint16_t duration);
 
+/*
+ * Ask the common layer to re-run Radio.Init() before the next API operation:
+ * called by a variant after it had to hard-reset a wedged radio (the reset
+ * drops the TCXO, regulator and calibration setup Radio.Init() programs).
+ */
+void sx12xx_request_reinit(void);
+
 int sx12xx_init(const struct device *dev);
 
 #endif /* ZEPHYR_DRIVERS_SX12XX_COMMON_H_ */

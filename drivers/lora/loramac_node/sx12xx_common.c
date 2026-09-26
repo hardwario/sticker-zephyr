@@ -8,6 +8,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/lora.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/lorawan/lorawan.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/kernel.h>
 
@@ -21,6 +22,26 @@
 #define STATE_CLEANUP   2
 
 LOG_MODULE_REGISTER(sx12xx_common, CONFIG_LORA_LOG_LEVEL);
+
+/*
+ * The radio driver below (loramac-node) is not thread-safe: every Radio.*
+ * call is a sequence of SPI transactions plus bookkeeping of the chip's
+ * operating mode. The DIO1 bottom half (the variant's IRQ work item) already
+ * runs Radio.IrqProcess() under lorawan_mac_lock(), but the lora_* API below
+ * used to drive the radio without it. A caller on its own thread (e.g. a raw
+ * LoRa P2P stack) whose receive timed out while a packet was completing
+ * could then put the radio to sleep and wake it again interleaved with the
+ * IRQ work reading and clearing the same chip, leaving the radio asleep while
+ * the driver believed it awake: BUSY stuck high and SX126xWaitOnBusy() spinning
+ * forever. Every radio access from this API therefore takes the same
+ * recursive lock. It is never held across a k_poll() wait, so the IRQ work
+ * can always complete the operation being waited for.
+ */
+#define RADIO_LOCK()   lorawan_mac_lock()
+#define RADIO_UNLOCK() lorawan_mac_unlock()
+
+/* Set by a variant after a hard radio reset; see sx12xx_request_reinit(). */
+static atomic_t reinit_pending;
 
 struct sx12xx_rx_params {
 	uint8_t *buf;
@@ -85,16 +106,36 @@ static inline bool modem_acquire(struct sx12xx_data *data)
  */
 static bool modem_release(struct sx12xx_data *data)
 {
+	RADIO_LOCK();
 	/* Increment atomic so both acquire and release will fail */
 	if (!atomic_cas(&data->modem_usage, STATE_BUSY, STATE_CLEANUP)) {
+		RADIO_UNLOCK();
 		return false;
 	}
 	/* Put radio back into sleep mode */
 	Radio.Sleep();
+	RADIO_UNLOCK();
 	/* Completely release modem */
 	data->operation_done = NULL;
 	atomic_clear(&data->modem_usage);
 	return true;
+}
+
+void sx12xx_request_reinit(void)
+{
+	atomic_set(&reinit_pending, 1);
+}
+
+/*
+ * Re-run the radio initialisation after a variant hard-reset a wedged radio.
+ * Called with the radio lock held and the modem acquired.
+ */
+static void reinit_if_pending(void)
+{
+	if (atomic_cas(&reinit_pending, 1, 0)) {
+		LOG_WRN("Re-initialising the radio after a reset");
+		Radio.Init(&dev_data.events);
+	}
 }
 
 static void sx12xx_ev_rx_done(uint8_t *payload, uint16_t size, int16_t rssi,
@@ -249,9 +290,12 @@ int sx12xx_lora_send_async(const struct device *dev, uint8_t *data,
 	/* Store signal */
 	dev_data.operation_done = async;
 
+	RADIO_LOCK();
+	reinit_if_pending();
 	Radio.SetMaxPayloadLength(MODEM_LORA, data_len);
 
 	Radio.Send(data, data_len);
+	RADIO_UNLOCK();
 
 	return 0;
 }
@@ -280,8 +324,11 @@ int sx12xx_lora_recv(const struct device *dev, uint8_t *data, uint8_t size,
 	dev_data.rx_params.rssi = rssi;
 	dev_data.rx_params.snr = snr;
 
+	RADIO_LOCK();
+	reinit_if_pending();
 	Radio.SetMaxPayloadLength(MODEM_LORA, 255);
 	Radio.Rx(0);
+	RADIO_UNLOCK();
 
 	ret = k_poll(&evt, 1, timeout);
 	if (ret < 0) {
@@ -328,8 +375,11 @@ int sx12xx_lora_recv_async(const struct device *dev, lora_recv_cb cb, void *user
 	dev_data.async_user_data = user_data;
 
 	/* Start reception */
+	RADIO_LOCK();
+	reinit_if_pending();
 	Radio.SetMaxPayloadLength(MODEM_LORA, 255);
 	Radio.Rx(0);
+	RADIO_UNLOCK();
 
 	return 0;
 }
@@ -342,6 +392,8 @@ int sx12xx_lora_config(const struct device *dev,
 		return -EBUSY;
 	}
 
+	RADIO_LOCK();
+	reinit_if_pending();
 	Radio.SetChannel(config->frequency);
 
 	if (config->tx) {
@@ -361,6 +413,7 @@ int sx12xx_lora_config(const struct device *dev,
 	}
 
 	Radio.SetPublicNetwork(config->public_network);
+	RADIO_UNLOCK();
 
 	modem_release(&dev_data);
 	return 0;
@@ -375,7 +428,10 @@ int sx12xx_lora_test_cw(const struct device *dev, uint32_t frequency,
 		return -EBUSY;
 	}
 
+	RADIO_LOCK();
+	reinit_if_pending();
 	Radio.SetTxContinuousWave(frequency, tx_power, duration);
+	RADIO_UNLOCK();
 	return 0;
 }
 
