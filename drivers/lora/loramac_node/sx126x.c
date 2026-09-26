@@ -363,9 +363,34 @@ void SX126xSetRfTxPower(int8_t power)
 	sx126x_set_tx_params(power, RADIO_RAMP_40_US);
 }
 
+/*
+ * Longest wait for BUSY to drop before the radio is treated as wedged. The
+ * slowest legitimate busy period is a wake-up from sleep with TCXO start-up
+ * and image calibration, a few milliseconds; ST's STM32WL HAL gives up after
+ * 100 ms as well (SUBGHZ_DEFAULT_TIMEOUT).
+ */
+#define SX126X_BUSY_TIMEOUT_MS 100
+
 void SX126xWaitOnBusy(void)
 {
+	int64_t start = k_uptime_get();
+
 	while (sx126x_is_busy(&dev_data)) {
+		if (k_uptime_get() - start > SX126X_BUSY_TIMEOUT_MS) {
+			/*
+			 * A radio stuck busy never recovers on its own: waiting
+			 * forever used to wedge the calling thread for good (seen
+			 * on STM32WL after a receive timed out mid-packet). Reset
+			 * it and have the common layer re-run Radio.Init() before
+			 * the next operation; the current one may fail.
+			 */
+			LOG_ERR("Radio BUSY for more than %d ms, resetting the radio",
+				SX126X_BUSY_TIMEOUT_MS);
+			sx126x_reset(&dev_data);
+			dev_data.mode = MODE_STDBY_RC;
+			sx12xx_request_reinit();
+			return;
+		}
 		k_sleep(K_MSEC(1));
 	}
 }
