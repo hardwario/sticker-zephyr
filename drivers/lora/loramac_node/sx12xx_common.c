@@ -405,10 +405,12 @@ int sx12xx_lora_send_recv_async(const struct device *dev, uint8_t *data, uint32_
 	sx12xx_turnaround_begin();
 	/* The RX-only settings (continuous mode, symbol timeout, IQ register)
 	 * now, so that TX-done only has to set the payload length, the IRQ mask
-	 * and SetRx. Same call as sx12xx_lora_config().
+	 * and SetRx. The packet parameters are shared with the transmission
+	 * below, so the CRC is on as sx12xx_lora_config() sets it for TX; the
+	 * receiver takes the CRC presence from the explicit header either way.
 	 */
 	Radio.SetRxConfig(MODEM_LORA, rx->bandwidth, rx->datarate, rx->coding_rate, 0,
-			  rx->preamble_len, 10, false, 0, false, 0, 0, rx->iq_inverted, true);
+			  rx->preamble_len, 10, false, 0, true, 0, 0, rx->iq_inverted, true);
 	Radio.SetMaxPayloadLength(MODEM_LORA, data_len);
 	dev_data.turnaround = true;
 	Radio.Send(data, data_len);
