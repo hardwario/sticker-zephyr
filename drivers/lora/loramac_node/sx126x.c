@@ -371,9 +371,53 @@ void SX126xSetRfTxPower(int8_t power)
  */
 #define SX126X_BUSY_TIMEOUT_MS 100
 
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+/*
+ * lora_send_recv_async() turnaround (sx12xx_common.h): while it runs, a BUSY
+ * period is first polled for up to this long -- a command's BUSY lasts
+ * microseconds, and the 1 ms sleep per check below would otherwise add up to
+ * milliseconds between TX-done and SetRx.
+ */
+#define SX126X_BUSY_SPIN_US 200
+#define SX126X_FALLBACK_STDBY_RC   0x20
+#define SX126X_FALLBACK_STDBY_XOSC 0x30
+
+static bool busy_spin;
+
+void sx12xx_turnaround_begin(void)
+{
+	busy_spin = true;
+	/* TX-done leaves the radio in STDBY_XOSC: the TCXO stays on, so the
+	 * following SetRx skips its start-up delay.
+	 */
+	SX126xSetRxTxFallbackMode(SX126X_FALLBACK_STDBY_XOSC);
+}
+
+void sx12xx_turnaround_armed(void)
+{
+	busy_spin = false;
+}
+
+void sx12xx_turnaround_end(void)
+{
+	busy_spin = false;
+	/* From RX or STDBY_XOSC: STDBY_RC switches the TCXO off; then the
+	 * default fallback again, before the radio goes to sleep.
+	 */
+	SX126xSetStandby(STDBY_RC);
+	SX126xSetRxTxFallbackMode(SX126X_FALLBACK_STDBY_RC);
+}
+#endif
+
 void SX126xWaitOnBusy(void)
 {
 	int64_t start = k_uptime_get();
+
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+	for (int i = 0; busy_spin && i < SX126X_BUSY_SPIN_US && sx126x_is_busy(&dev_data); i++) {
+		k_busy_wait(1);
+	}
+#endif
 
 	while (sx126x_is_busy(&dev_data)) {
 		if (k_uptime_get() - start > SX126X_BUSY_TIMEOUT_MS) {
@@ -501,6 +545,9 @@ static DEVICE_API(lora, sx126x_lora_api) = {
 	.recv = sx12xx_lora_recv,
 	.recv_async = sx12xx_lora_recv_async,
 	.test_cw = sx12xx_lora_test_cw,
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+	.send_recv_async = sx12xx_lora_send_recv_async,
+#endif
 };
 
 DEVICE_DT_INST_DEFINE(0, &sx126x_lora_init, NULL, &dev_data,

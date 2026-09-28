@@ -7,6 +7,7 @@
 #include <zephyr/kernel.h>
 
 #include "sx126x_common.h"
+#include "sx12xx_common.h"
 
 #include <stm32wlxx_ll_exti.h>
 #include <stm32wlxx_ll_pwr.h>
@@ -119,6 +120,9 @@ static void radio_isr(const struct device *dev)
 {
 	struct sx126x_data *dev_data = dev->data;
 
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+	sx12xx_irq_cyc = k_cycle_get_32();
+#endif
 	irq_disable(DT_INST_IRQN(0));
 	k_work_submit(&dev_data->dio1_irq_work);
 }
