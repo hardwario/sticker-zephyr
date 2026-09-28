@@ -188,6 +188,27 @@ typedef int (*lora_api_recv_async)(const struct device *dev, lora_recv_cb cb,
 			     void *user_data);
 
 /**
+ * @brief Turnaround timing of lora_send_recv_async(), in k_cycle_get_32() units.
+ */
+struct lora_turnaround {
+	/** The radio's TX-done interrupt. */
+	uint32_t tx_done_cyc;
+	/** Reception running (SetRx accepted by the radio). */
+	uint32_t rx_armed_cyc;
+};
+
+/**
+ * @typedef lora_api_send_recv_async()
+ * @brief Callback API for a transmission followed at once by reception
+ *
+ * @see lora_send_recv_async() for argument descriptions.
+ */
+typedef int (*lora_api_send_recv_async)(const struct device *dev, uint8_t *data,
+					uint32_t data_len, lora_recv_cb cb, void *user_data,
+					struct k_poll_signal *tx_done,
+					struct lora_turnaround *timing);
+
+/**
  * @typedef lora_api_test_cw()
  * @brief Callback API for transmitting a continuous wave
  *
@@ -203,6 +224,9 @@ __subsystem struct lora_driver_api {
 	lora_api_recv recv;
 	lora_api_recv_async recv_async;
 	lora_api_test_cw test_cw;
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+	lora_api_send_recv_async send_recv_async;
+#endif
 };
 
 /** @endcond */
@@ -314,6 +338,45 @@ static inline int lora_recv_async(const struct device *dev, lora_recv_cb cb,
 
 	return api->recv_async(dev, cb, user_data);
 }
+
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+/**
+ * @brief Transmit, then receive asynchronously with no radio sleep in between
+ *
+ * Sends like lora_send_async() with the TX configuration, and on the radio's
+ * TX-done interrupt switches it straight to continuous reception, as
+ * lora_recv_async() would, without putting it to sleep or waiting for the
+ * caller. Reception uses the RX configuration of the last lora_config() call
+ * with @a tx false, which must be on the same frequency as the TX one; only
+ * the RX-specific settings of that configuration are applied, before the
+ * transmission. Stop the reception with lora_recv_async(dev, NULL, NULL).
+ * Needs CONFIG_LORA_SEND_RECV_ASYNC.
+ *
+ * @param dev      LoRa device
+ * @param data     Data to be sent
+ * @param data_len Length of the data to be sent
+ * @param cb       Callback for every packet received, as for lora_recv_async()
+ * @param user_data User data passed to @a cb
+ * @param tx_done  Raised once the transmission ended: result 0 with reception
+ *                 running, or a negative error code (the modem is released)
+ * @param timing   Optional turnaround timestamps, valid once @a tx_done is 0
+ * @return 0 when the transmission started, -EBUSY if the modem is in use,
+ *         -EINVAL without matching TX and RX configurations, -ENOSYS if the
+ *         driver lacks this call
+ */
+static inline int lora_send_recv_async(const struct device *dev, uint8_t *data,
+				       uint32_t data_len, lora_recv_cb cb, void *user_data,
+				       struct k_poll_signal *tx_done,
+				       struct lora_turnaround *timing)
+{
+	const struct lora_driver_api *api = (const struct lora_driver_api *)dev->api;
+
+	if (api->send_recv_async == NULL) {
+		return -ENOSYS;
+	}
+	return api->send_recv_async(dev, data, data_len, cb, user_data, tx_done, timing);
+}
+#endif /* CONFIG_LORA_SEND_RECV_ASYNC */
 
 /**
  * @brief Transmit an unmodulated continuous wave at a given frequency

@@ -9,6 +9,7 @@
 #include <zephyr/kernel.h>
 
 #include "sx126x_common.h"
+#include "sx12xx_common.h"
 
 #include <zephyr/logging/log.h>
 LOG_MODULE_DECLARE(sx126x, CONFIG_LORA_LOG_LEVEL);
@@ -57,6 +58,9 @@ static void sx126x_dio1_irq_callback(const struct device *dev,
 						    dio1_irq_callback);
 
 	if (pins & BIT(sx126x_gpio_dio1.pin)) {
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+		sx12xx_irq_cyc = k_cycle_get_32();
+#endif
 		k_work_submit(&dev_data->dio1_irq_work);
 	}
 }

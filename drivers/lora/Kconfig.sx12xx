@@ -34,3 +34,12 @@ config LORA_STM32WL_SUBGHZ_RADIO
 	select GPIO
 	help
 	  Enable LoRa driver for STM32WL SUBGHZ radio.
+
+config LORA_SEND_RECV_ASYNC
+	bool "lora_send_recv_async(): transmit, then receive without radio sleep"
+	depends on LORA_SX126X || LORA_STM32WL_SUBGHZ_RADIO
+	help
+	  Adds lora_send_recv_async() to the SX126x drivers: on TX-done the
+	  radio switches straight to continuous reception, with the TCXO kept
+	  on and no sleep in between, for a reply expected a few milliseconds
+	  after the transmission. lora_send() and lora_recv() are unchanged.
