@@ -35,6 +35,17 @@ config LORA_STM32WL_SUBGHZ_RADIO
 	help
 	  Enable LoRa driver for STM32WL SUBGHZ radio.
 
+config LORA_RX_BOOSTED_GAIN
+	bool "Receive with the SX126x boosted LNA gain"
+	depends on LORA_SX126X || LORA_STM32WL_SUBGHZ_RADIO
+	help
+	  lora_recv(), lora_recv_async() and the reception of
+	  lora_send_recv_async() start the radio with the boosted LNA gain
+	  (RxGain 0x96) instead of the power-saving one (0x94): about +2 dB
+	  sensitivity for about +1 mA while receiving. SetRxBoosted writes the
+	  register on every reception, so it needs no retention across sleep.
+	  The LoRaWAN stack calls the radio itself and keeps the default gain.
+
 config LORA_SEND_RECV_ASYNC
 	bool "lora_send_recv_async(): transmit, then receive without radio sleep"
 	depends on LORA_SX126X || LORA_STM32WL_SUBGHZ_RADIO

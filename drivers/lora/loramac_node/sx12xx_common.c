@@ -43,6 +43,18 @@ LOG_MODULE_REGISTER(sx12xx_common, CONFIG_LORA_LOG_LEVEL);
 /* Set by a variant after a hard radio reset; see sx12xx_request_reinit(). */
 static atomic_t reinit_pending;
 
+/* Continuous reception for the lora_* API, with the boosted LNA gain if
+ * CONFIG_LORA_RX_BOOSTED_GAIN (the SX127x has no RxBoosted).
+ */
+static void sx12xx_rx_start(void)
+{
+	if (IS_ENABLED(CONFIG_LORA_RX_BOOSTED_GAIN) && Radio.RxBoosted != NULL) {
+		Radio.RxBoosted(0);
+	} else {
+		Radio.Rx(0);
+	}
+}
+
 #if defined(CONFIG_LORA_SEND_RECV_ASYNC)
 volatile uint32_t sx12xx_irq_cyc;
 
@@ -181,7 +193,7 @@ static void sx12xx_ev_rx_done(uint8_t *payload, uint16_t size, int16_t rssi,
 	/* Receiving in asynchronous mode */
 	if (dev_data.async_rx_cb) {
 		/* Start receiving again */
-		Radio.Rx(0);
+		sx12xx_rx_start();
 		/* Run the callback */
 		dev_data.async_rx_cb(dev_data.dev, payload, size, rssi, snr,
 				   dev_data.async_user_data);
@@ -246,7 +258,7 @@ static void sx12xx_ev_tx_done(void)
 		dev_data.async_rx_cb = dev_data.turnaround_cb;
 		dev_data.async_user_data = dev_data.turnaround_user_data;
 		Radio.SetMaxPayloadLength(MODEM_LORA, 255);
-		Radio.Rx(0);
+		sx12xx_rx_start();
 		if (dev_data.turnaround_timing) {
 			dev_data.turnaround_timing->rx_armed_cyc = k_cycle_get_32();
 			dev_data.turnaround_timing->tx_done_cyc = tx_done_cyc;
@@ -292,7 +304,7 @@ static void sx12xx_ev_rx_error(void)
 	/* Receiving in asynchronous mode */
 	if (dev_data.async_rx_cb) {
 		/* Start receiving again */
-		Radio.Rx(0);
+		sx12xx_rx_start();
 		/* Don't run the synchronous code */
 		return;
 	}
@@ -447,7 +459,7 @@ int sx12xx_lora_recv(const struct device *dev, uint8_t *data, uint8_t size,
 	RADIO_LOCK();
 	reinit_if_pending();
 	Radio.SetMaxPayloadLength(MODEM_LORA, 255);
-	Radio.Rx(0);
+	sx12xx_rx_start();
 	RADIO_UNLOCK();
 
 	ret = k_poll(&evt, 1, timeout);
@@ -498,7 +510,7 @@ int sx12xx_lora_recv_async(const struct device *dev, lora_recv_cb cb, void *user
 	RADIO_LOCK();
 	reinit_if_pending();
 	Radio.SetMaxPayloadLength(MODEM_LORA, 255);
-	Radio.Rx(0);
+	sx12xx_rx_start();
 	RADIO_UNLOCK();
 
 	return 0;
