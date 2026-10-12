@@ -501,9 +501,10 @@ int sx12xx_lora_send_recv_async(const struct device *dev, uint8_t *data, uint32_
 				  rx->fsk.fixed_len != 0U || rx->fsk.sw_length, rx->fsk.fixed_len,
 				  rx->fsk.crc != LORA_FSK_CRC_OFF, 0, 0, false, false);
 		sx12xx_fsk_packet(&rx->fsk, data_len);
-	} else
-#endif
+	} else {
+#else
 	{
+#endif
 		Radio.SetRxConfig(MODEM_LORA, rx->bandwidth, rx->datarate, rx->coding_rate, 0,
 				  rx->preamble_len, 10, false, 0, true, 0, 0, rx->iq_inverted,
 				  true);
@@ -634,8 +635,9 @@ int sx12xx_lora_config(const struct device *dev,
 #endif
 			dev_data.fsk_rx_len = f->fixed_len != 0U ? f->fixed_len : 255U;
 			Radio.SetRxConfig(MODEM_FSK, f->bandwidth / 2U, f->bitrate, 0,
-					  f->bandwidth / 2U, f->preamble_len, 0, fixed, f->fixed_len,
-					  f->crc != LORA_FSK_CRC_OFF, 0, 0, false, false);
+					  f->bandwidth / 2U, f->preamble_len, 0, fixed,
+					  f->fixed_len, f->crc != LORA_FSK_CRC_OFF, 0, 0, false,
+					  false);
 		}
 		dev_data.fsk_cfg = *f;
 		/* SetTx/RxConfig() reset the sync word, CRC and whitening. A
