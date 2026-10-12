@@ -66,6 +66,24 @@ void sx12xx_turnaround_end(void);
 extern volatile uint32_t sx12xx_irq_cyc;
 #endif
 
+#if defined(CONFIG_LORA_FSK)
+/*
+ * Implemented by the variant: (re)write the GFSK packet parameters, sync word,
+ * CRC and whitening of cfg, with payload_len as the length a reception takes
+ * (its maximum with variable length). Called with the radio lock held, after
+ * every Radio.SetTxConfig()/SetRxConfig(), which reset them.
+ */
+void sx12xx_fsk_packet(const struct lora_fsk_config *cfg, uint8_t payload_len);
+
+/* Implemented by the variant: the radio was configured for LoRa. */
+void sx12xx_fsk_off(void);
+
+/* Implemented by the variant: RSSI (dBm) of the (G)FSK packet just received;
+ * Radio.RxDone() passes the last LoRa packet's.
+ */
+int16_t sx12xx_fsk_rssi(void);
+#endif
+
 int sx12xx_init(const struct device *dev);
 
 #endif /* ZEPHYR_DRIVERS_SX12XX_COMMON_H_ */

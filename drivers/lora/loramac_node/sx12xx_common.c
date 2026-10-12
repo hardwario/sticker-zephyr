@@ -87,6 +87,15 @@ static struct sx12xx_data {
 	struct lora_modem_config tx_cfg;
 	atomic_t modem_usage;
 	struct sx12xx_rx_params rx_params;
+#if defined(CONFIG_LORA_FSK)
+	/* The last lora_config() chose (G)FSK; its packet format, and the
+	 * length a reception takes (the RX configuration's fixed length, 255
+	 * with variable length).
+	 */
+	bool fsk;
+	struct lora_fsk_config fsk_cfg;
+	uint8_t fsk_rx_len;
+#endif
 #if defined(CONFIG_LORA_SEND_RECV_ASYNC)
 	/* The last RX configuration, for lora_send_recv_async(). */
 	struct lora_modem_config rx_cfg;
@@ -100,6 +109,46 @@ static struct sx12xx_data {
 	struct lora_turnaround *turnaround_timing;
 #endif
 } dev_data;
+
+#if defined(CONFIG_LORA_FSK)
+#define SX12XX_MODEM() (dev_data.fsk ? MODEM_FSK : MODEM_LORA)
+#else
+#define SX12XX_MODEM() MODEM_LORA
+#endif
+
+/* Before a reception: LoRa and variable-length (G)FSK read the length from
+ * the packet; fixed-length (G)FSK takes the RX configuration's length, which
+ * a transmission (it sets its own) or a reconfiguration has replaced.
+ */
+static void sx12xx_rx_length(void)
+{
+#if defined(CONFIG_LORA_FSK)
+	if (dev_data.fsk) {
+		sx12xx_fsk_packet(&dev_data.fsk_cfg, dev_data.fsk_rx_len);
+		return;
+	}
+#endif
+	Radio.SetMaxPayloadLength(MODEM_LORA, 255);
+}
+
+/* Expected time on air of a data_len transmission, in ms. */
+static uint32_t sx12xx_air_time(uint32_t data_len)
+{
+#if defined(CONFIG_LORA_FSK)
+	if (dev_data.fsk) {
+		const struct lora_fsk_config *f = &dev_data.fsk_cfg;
+		bool no_len = f->fixed_len != 0U || f->sw_length;
+		uint32_t bytes = f->preamble_len + f->sync_word_len + (no_len ? 0U : 1U) +
+				 data_len + (f->crc != LORA_FSK_CRC_OFF ? 2U : 0U);
+
+		/* A short packet is mostly the radio's own start-up: margin. */
+		return DIV_ROUND_UP(bytes * 8U * 1000U, f->bitrate) + 10U;
+	}
+#endif
+	return Radio.TimeOnAir(MODEM_LORA, dev_data.tx_cfg.bandwidth, dev_data.tx_cfg.datarate,
+			       dev_data.tx_cfg.coding_rate, dev_data.tx_cfg.preamble_len, 0,
+			       data_len, true);
+}
 
 int __sx12xx_configure_pin(const struct gpio_dt_spec *gpio, gpio_flags_t flags)
 {
@@ -190,6 +239,13 @@ static void sx12xx_ev_rx_done(uint8_t *payload, uint16_t size, int16_t rssi,
 {
 	struct k_poll_signal *sig = dev_data.operation_done;
 
+#if defined(CONFIG_LORA_FSK)
+	if (dev_data.fsk) {
+		/* Before a new reception starts: no SNR in (G)FSK. */
+		rssi = sx12xx_fsk_rssi();
+		snr = 0;
+	}
+#endif
 	/* Receiving in asynchronous mode */
 	if (dev_data.async_rx_cb) {
 		/* Start receiving again */
@@ -257,7 +313,7 @@ static void sx12xx_ev_tx_done(void)
 		dev_data.turnaround_rx = true;
 		dev_data.async_rx_cb = dev_data.turnaround_cb;
 		dev_data.async_user_data = dev_data.turnaround_user_data;
-		Radio.SetMaxPayloadLength(MODEM_LORA, 255);
+		sx12xx_rx_length();
 		sx12xx_rx_start();
 		if (dev_data.turnaround_timing) {
 			dev_data.turnaround_timing->rx_armed_cyc = k_cycle_get_32();
@@ -340,12 +396,7 @@ int sx12xx_lora_send(const struct device *dev, uint8_t *data,
 	}
 
 	/* Calculate expected airtime of the packet */
-	air_time = Radio.TimeOnAir(MODEM_LORA,
-				   dev_data.tx_cfg.bandwidth,
-				   dev_data.tx_cfg.datarate,
-				   dev_data.tx_cfg.coding_rate,
-				   dev_data.tx_cfg.preamble_len,
-				   0, data_len, true);
+	air_time = sx12xx_air_time(data_len);
 	LOG_DBG("Expected air time of %d bytes = %dms", data_len, air_time);
 
 	/* Wait for the packet to finish transmitting.
@@ -377,7 +428,7 @@ int sx12xx_lora_send_async(const struct device *dev, uint8_t *data,
 
 	RADIO_LOCK();
 	reinit_if_pending();
-	Radio.SetMaxPayloadLength(MODEM_LORA, data_len);
+	Radio.SetMaxPayloadLength(SX12XX_MODEM(), data_len);
 
 	Radio.Send(data, data_len);
 	RADIO_UNLOCK();
@@ -386,6 +437,27 @@ int sx12xx_lora_send_async(const struct device *dev, uint8_t *data,
 }
 
 #if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+/* One modulation both ways: the RX settings applied before the TX replace the
+ * packet parameters the transmission uses as well.
+ */
+static bool sx12xx_same_modulation(const struct lora_modem_config *a,
+				   const struct lora_modem_config *b)
+{
+#if defined(CONFIG_LORA_FSK)
+	if (a->modem != b->modem) {
+		return false;
+	}
+	if (a->modem == LORA_MODEM_FSK) {
+		return a->fsk.bitrate == b->fsk.bitrate && a->fsk.fdev == b->fsk.fdev &&
+		       (a->fsk.fixed_len == 0U) == (b->fsk.fixed_len == 0U) &&
+		       a->fsk.sw_length == b->fsk.sw_length;
+	}
+#endif
+	return a->bandwidth == b->bandwidth && a->datarate == b->datarate &&
+	       a->coding_rate == b->coding_rate && a->preamble_len == b->preamble_len &&
+	       a->iq_inverted == b->iq_inverted && a->public_network == b->public_network;
+}
+
 int sx12xx_lora_send_recv_async(const struct device *dev, uint8_t *data, uint32_t data_len,
 				lora_recv_cb cb, void *user_data, struct k_poll_signal *tx_done,
 				struct lora_turnaround *timing)
@@ -397,9 +469,7 @@ int sx12xx_lora_send_recv_async(const struct device *dev, uint8_t *data, uint32_
 	 * packet parameters the transmission uses as well.
 	 */
 	if (cb == NULL || !tx->frequency || rx->frequency != tx->frequency ||
-	    rx->bandwidth != tx->bandwidth || rx->datarate != tx->datarate ||
-	    rx->coding_rate != tx->coding_rate || rx->preamble_len != tx->preamble_len ||
-	    rx->iq_inverted != tx->iq_inverted || rx->public_network != tx->public_network) {
+	    !sx12xx_same_modulation(rx, tx)) {
 		return -EINVAL;
 	}
 
@@ -421,9 +491,25 @@ int sx12xx_lora_send_recv_async(const struct device *dev, uint8_t *data, uint32_
 	 * below, so the CRC is on as sx12xx_lora_config() sets it for TX; the
 	 * receiver takes the CRC presence from the explicit header either way.
 	 */
-	Radio.SetRxConfig(MODEM_LORA, rx->bandwidth, rx->datarate, rx->coding_rate, 0,
-			  rx->preamble_len, 10, false, 0, true, 0, 0, rx->iq_inverted, true);
-	Radio.SetMaxPayloadLength(MODEM_LORA, data_len);
+#if defined(CONFIG_LORA_FSK)
+	if (dev_data.fsk) {
+		/* Same packet format both ways (checked above); the TX sets
+		 * its length, TX-done sets the RX one.
+		 */
+		Radio.SetRxConfig(MODEM_FSK, rx->fsk.bandwidth / 2U, rx->fsk.bitrate, 0,
+				  rx->fsk.bandwidth / 2U, rx->fsk.preamble_len, 0,
+				  rx->fsk.fixed_len != 0U || rx->fsk.sw_length, rx->fsk.fixed_len,
+				  rx->fsk.crc != LORA_FSK_CRC_OFF, 0, 0, false, false);
+		sx12xx_fsk_packet(&rx->fsk, data_len);
+	} else {
+#else
+	{
+#endif
+		Radio.SetRxConfig(MODEM_LORA, rx->bandwidth, rx->datarate, rx->coding_rate, 0,
+				  rx->preamble_len, 10, false, 0, true, 0, 0, rx->iq_inverted,
+				  true);
+	}
+	Radio.SetMaxPayloadLength(SX12XX_MODEM(), data_len);
 	dev_data.turnaround = true;
 	Radio.Send(data, data_len);
 	RADIO_UNLOCK();
@@ -458,7 +544,7 @@ int sx12xx_lora_recv(const struct device *dev, uint8_t *data, uint8_t size,
 
 	RADIO_LOCK();
 	reinit_if_pending();
-	Radio.SetMaxPayloadLength(MODEM_LORA, 255);
+	sx12xx_rx_length();
 	sx12xx_rx_start();
 	RADIO_UNLOCK();
 
@@ -509,7 +595,7 @@ int sx12xx_lora_recv_async(const struct device *dev, lora_recv_cb cb, void *user
 	/* Start reception */
 	RADIO_LOCK();
 	reinit_if_pending();
-	Radio.SetMaxPayloadLength(MODEM_LORA, 255);
+	sx12xx_rx_length();
 	sx12xx_rx_start();
 	RADIO_UNLOCK();
 
@@ -527,6 +613,43 @@ int sx12xx_lora_config(const struct device *dev,
 	RADIO_LOCK();
 	reinit_if_pending();
 	Radio.SetChannel(config->frequency);
+
+#if defined(CONFIG_LORA_FSK)
+	dev_data.fsk = config->modem == LORA_MODEM_FSK;
+	if (dev_data.fsk) {
+		const struct lora_fsk_config *f = &config->fsk;
+		bool fixed = f->fixed_len != 0U || f->sw_length;
+
+		if (config->tx) {
+			memcpy(&dev_data.tx_cfg, config, sizeof(dev_data.tx_cfg));
+			/* The RX bandwidth too: the modulation parameters are
+			 * shared, and a reception may follow without a new
+			 * RX configuration.
+			 */
+			Radio.SetTxConfig(MODEM_FSK, config->tx_power, f->fdev, f->bandwidth / 2U,
+					  f->bitrate, 0, f->preamble_len, fixed,
+					  f->crc != LORA_FSK_CRC_OFF, 0, 0, false, 4000);
+		} else {
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+			memcpy(&dev_data.rx_cfg, config, sizeof(dev_data.rx_cfg));
+#endif
+			dev_data.fsk_rx_len = f->fixed_len != 0U ? f->fixed_len : 255U;
+			Radio.SetRxConfig(MODEM_FSK, f->bandwidth / 2U, f->bitrate, 0,
+					  f->bandwidth / 2U, f->preamble_len, 0, fixed,
+					  f->fixed_len, f->crc != LORA_FSK_CRC_OFF, 0, 0, false,
+					  false);
+		}
+		dev_data.fsk_cfg = *f;
+		/* SetTx/RxConfig() reset the sync word, CRC and whitening. A
+		 * transmission sets its own length.
+		 */
+		sx12xx_fsk_packet(f, config->tx ? 255U : dev_data.fsk_rx_len);
+		RADIO_UNLOCK();
+		modem_release(&dev_data);
+		return 0;
+	}
+	sx12xx_fsk_off();
+#endif
 
 	if (config->tx) {
 		/* Store TX config locally for airtime calculations */

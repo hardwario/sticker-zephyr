@@ -77,6 +77,77 @@ enum lora_coding_rate {
 	CR_4_8 = 4,  /**< Coding rate 4/8 (4 information bits, 4 error correction bits) */
 };
 
+#if defined(CONFIG_LORA_FSK) || defined(__DOXYGEN__)
+/**
+ * @brief Modem used by lora_config() (CONFIG_LORA_FSK)
+ */
+enum lora_modem_type {
+	LORA_MODEM_LORA = 0, /**< LoRa, the default of a zeroed configuration */
+	LORA_MODEM_FSK,      /**< (G)FSK, set by @ref lora_fsk_config */
+};
+
+/**
+ * @brief Packet CRC of the (G)FSK modem (CONFIG_LORA_FSK)
+ */
+enum lora_fsk_crc {
+	LORA_FSK_CRC_OFF = 0,     /**< No CRC */
+	LORA_FSK_CRC_2_BYTES,     /**< 16-bit CRC as computed */
+	LORA_FSK_CRC_2_BYTES_INV, /**< 16-bit CRC, sent inverted */
+};
+
+/**
+ * @brief (G)FSK modem parameters (CONFIG_LORA_FSK)
+ *
+ * The packet is preamble, sync word, a length byte unless @ref fixed_len,
+ * the payload and the CRC. Whitening covers the length byte, the payload
+ * and the CRC.
+ */
+struct lora_fsk_config {
+	/** Bit rate in bit/s */
+	uint32_t bitrate;
+	/** Frequency deviation in Hz */
+	uint32_t fdev;
+	/** Receiver bandwidth in Hz, double-sided; the radio takes its
+	 *  nearest step at or above it
+	 */
+	uint32_t bandwidth;
+	/** Preamble length in bytes */
+	uint16_t preamble_len;
+	/** Sync word, first byte sent first */
+	uint8_t sync_word[8];
+	/** Sync word length in bytes, 1..8 */
+	uint8_t sync_word_len;
+	/** 0: variable length (length byte after the sync word); otherwise
+	 *  fixed-length packets: a reception takes this many bytes, a
+	 *  transmission sends the bytes it is given
+	 */
+	uint8_t fixed_len;
+	/** Packet CRC */
+	enum lora_fsk_crc crc;
+	/** CRC initial value */
+	uint16_t crc_seed;
+	/** CRC polynomial */
+	uint16_t crc_poly;
+	/** Whitening on */
+	bool whitening;
+	/** Whitening LFSR initial value (9 bits) */
+	uint16_t whitening_seed;
+	/** Length in software, for a peer whose whitening or CRC the radio
+	 *  cannot reproduce (radio whitening and CRC off, the caller frames
+	 *  the packet): the packet has no length byte the radio reads, a
+	 *  transmission sends the bytes it is given, and a reception reads
+	 *  the first payload byte as it arrives and ends the packet after
+	 *  (byte ^ @ref len_xor) + @ref len_extra more bytes. With
+	 *  @ref fixed_len 0 only.
+	 */
+	bool sw_length;
+	/** Mask of the first payload byte, see @ref sw_length */
+	uint8_t len_xor;
+	/** Bytes after those the length byte counts, see @ref sw_length */
+	uint8_t len_extra;
+};
+#endif
+
 /**
  * @struct lora_modem_config
  * Structure containing the configuration of a LoRa modem
@@ -122,6 +193,16 @@ struct lora_modem_config {
 	 * interacting with a public network.
 	 */
 	bool public_network;
+
+#if defined(CONFIG_LORA_FSK) || defined(__DOXYGEN__)
+	/** Modem: LoRa (default) or (G)FSK. With (G)FSK only frequency,
+	 *  tx_power, tx and @ref fsk are used.
+	 */
+	enum lora_modem_type modem;
+
+	/** (G)FSK parameters, used with LORA_MODEM_FSK */
+	struct lora_fsk_config fsk;
+#endif
 };
 
 /**
