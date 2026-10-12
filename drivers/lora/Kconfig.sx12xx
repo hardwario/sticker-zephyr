@@ -46,6 +46,19 @@ config LORA_RX_BOOSTED_GAIN
 	  register on every reception, so it needs no retention across sleep.
 	  The LoRaWAN stack calls the radio itself and keeps the default gain.
 
+config LORA_FSK
+	bool "(G)FSK packets through the lora_* API"
+	depends on LORA_SX126X || LORA_STM32WL_SUBGHZ_RADIO
+	help
+	  Adds a modem selector and (G)FSK parameters to struct
+	  lora_modem_config. With modem LORA_MODEM_FSK, lora_config(),
+	  lora_send(), lora_recv() and their async variants run the SX126x
+	  GFSK packet engine instead of LoRa: bit rate, deviation, RX
+	  bandwidth, preamble, a sync word of up to 8 bytes, variable or fixed
+	  length, CRC and whitening are set by the caller. The pulse shape is
+	  Gaussian BT 1.0. Without this option the API and the driver are
+	  unchanged.
+
 config LORA_SEND_RECV_ASYNC
 	bool "lora_send_recv_async(): transmit, then receive without radio sleep"
 	depends on LORA_SX126X || LORA_STM32WL_SUBGHZ_RADIO

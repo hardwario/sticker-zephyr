@@ -9,6 +9,8 @@
 #include <zephyr/drivers/lora.h>
 #include <zephyr/drivers/spi.h>
 #include <zephyr/kernel.h>
+#include <zephyr/sys/util.h>
+#include <string.h>
 #include <zephyr/lorawan/lorawan.h>
 
 #include <sx126x/sx126x.h>
@@ -409,6 +411,120 @@ void sx12xx_turnaround_end(void)
 }
 #endif
 
+#if defined(CONFIG_LORA_FSK)
+/* Payload length register, live during a reception (Semtech's long-packet
+ * support in the SX126x driver SWDR001 writes it the same way).
+ */
+#define SX126X_REG_RXTX_PAYLOAD_LEN 0x06BB
+
+/* lora_fsk_config.sw_length of the last packet format; 0 bitrate = off. */
+static struct {
+	uint32_t bitrate;
+	uint8_t len_xor;
+	uint8_t len_extra;
+} fsk_sw_len;
+
+/* A sync word was found in a reception with the length in software: wait
+ * for the first payload byte, then set the packet length it gives before
+ * the radio has received that many bytes. Runs before Radio.IrqProcess().
+ */
+static void sx126x_fsk_sw_length(void)
+{
+	if (fsk_sw_len.bitrate == 0U || dev_data.mode != MODE_RX ||
+	    SX126xGetPacketType() != PACKET_TYPE_GFSK) {
+		return;
+	}
+
+	uint16_t irq = SX126xGetIrqStatus();
+
+	/* A preamble seen before the sync word: wait the sync word out here,
+	 * or Radio.IrqProcess() would clear a SYNCWORD_VALID that arrives in
+	 * the meantime together with this one, and the packet would then run
+	 * to the 255-byte fixed length. Noise trips the detector too, hence
+	 * the bound: the sync word's airtime plus margin.
+	 */
+	if ((irq & (IRQ_PREAMBLE_DETECTED | IRQ_SYNCWORD_VALID)) == IRQ_PREAMBLE_DETECTED) {
+		uint32_t wait_us = DIV_ROUND_UP(8U * 8U * USEC_PER_SEC, fsk_sw_len.bitrate) + 500U;
+		uint32_t t0 = k_cycle_get_32();
+
+		do {
+			irq = SX126xGetIrqStatus();
+		} while ((irq & IRQ_SYNCWORD_VALID) == 0U &&
+			 k_cyc_to_us_floor32(k_cycle_get_32() - t0) < wait_us);
+	}
+	if ((irq & IRQ_SYNCWORD_VALID) == 0U || (irq & IRQ_RX_DONE) != 0U) {
+		return;
+	}
+	SX126xClearIrqStatus(IRQ_SYNCWORD_VALID);
+	/* One byte after the sync word, plus margin. */
+	k_busy_wait(DIV_ROUND_UP(8U * USEC_PER_SEC, fsk_sw_len.bitrate) + 100U);
+
+	uint8_t b;
+
+	SX126xReadBuffer(0, &b, 1);
+
+	uint32_t len = 1U + (uint8_t)(b ^ fsk_sw_len.len_xor) + fsk_sw_len.len_extra;
+
+	SX126xWriteRegister(SX126X_REG_RXTX_PAYLOAD_LEN, (uint8_t)MIN(len, 255U));
+}
+
+void sx12xx_fsk_packet(const struct lora_fsk_config *cfg, uint8_t payload_len)
+{
+	PacketParams_t *pp = &SX126x.PacketParams;
+	uint8_t sync[8] = {0};
+	uint8_t sync_len = MIN(cfg->sync_word_len, sizeof(sync));
+
+	memcpy(sync, cfg->sync_word, sync_len);
+
+	pp->PacketType = PACKET_TYPE_GFSK;
+	pp->Params.Gfsk.PreambleLength = cfg->preamble_len * 8U;
+	pp->Params.Gfsk.SyncWordLength = sync_len * 8U;
+	pp->Params.Gfsk.HeaderType = (cfg->fixed_len || cfg->sw_length)
+					     ? RADIO_PACKET_FIXED_LENGTH
+					     : RADIO_PACKET_VARIABLE_LENGTH;
+	pp->Params.Gfsk.PayloadLength = payload_len;
+	switch (cfg->crc) {
+	case LORA_FSK_CRC_2_BYTES:
+		pp->Params.Gfsk.CrcLength = RADIO_CRC_2_BYTES;
+		break;
+	case LORA_FSK_CRC_2_BYTES_INV:
+		pp->Params.Gfsk.CrcLength = RADIO_CRC_2_BYTES_INV;
+		break;
+	default:
+		pp->Params.Gfsk.CrcLength = RADIO_CRC_OFF;
+		break;
+	}
+	pp->Params.Gfsk.DcFree = cfg->whitening ? RADIO_DC_FREEWHITENING : RADIO_DC_FREE_OFF;
+
+	SX126xSetPacketParams(pp);
+	SX126xSetSyncWord(sync);
+	if (cfg->crc != LORA_FSK_CRC_OFF) {
+		SX126xSetCrcSeed(cfg->crc_seed);
+		SX126xSetCrcPolynomial(cfg->crc_poly);
+	}
+	if (cfg->whitening) {
+		SX126xSetWhiteningSeed(cfg->whitening_seed);
+	}
+	fsk_sw_len.bitrate = (cfg->sw_length && cfg->fixed_len == 0U) ? cfg->bitrate : 0U;
+	fsk_sw_len.len_xor = cfg->len_xor;
+	fsk_sw_len.len_extra = cfg->len_extra;
+}
+
+int16_t sx12xx_fsk_rssi(void)
+{
+	PacketStatus_t st;
+
+	SX126xGetPacketStatus(&st);
+	return st.Params.Gfsk.RssiSync;
+}
+
+/* The radio leaves (G)FSK: no length in software any more. */
+void sx12xx_fsk_off(void)
+{
+	fsk_sw_len.bitrate = 0U;
+}
+#endif
+
 void SX126xWaitOnBusy(void)
 {
 	int64_t start = k_uptime_get();
@@ -491,6 +607,9 @@ static void sx126x_dio1_irq_work_handler(struct k_work *work)
 	lorawan_mac_lock();
 
 	dev_data.radio_dio_irq(NULL);
+#if defined(CONFIG_LORA_FSK)
+	sx126x_fsk_sw_length();
+#endif
 	if (Radio.IrqProcess) {
 		Radio.IrqProcess();
 	}
