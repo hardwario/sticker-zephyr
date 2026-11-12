@@ -322,6 +322,18 @@ int lorawan_start(void);
 int lorawan_send(uint8_t port, uint8_t *data, uint8_t len, enum lorawan_message_type type);
 
 /**
+ * @brief Wait before the duty cycle admits a frame again
+ *
+ * After lorawan_send() returned -ECONNREFUSED (every band whose channels are
+ * enabled is out of duty-cycle credits), this is the time in milliseconds
+ * until the MAC has a band with credits again, as LoRaMac computed it. 0 after
+ * any other outcome of lorawan_send(), or when the MAC gave no wait.
+ *
+ * @return Wait in milliseconds
+ */
+uint32_t lorawan_get_duty_cycle_wait_ms(void);
+
+/**
  * @brief Set the current device class
  *
  * Change the current device class. This function may be called before
