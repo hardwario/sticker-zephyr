@@ -87,6 +87,8 @@ static LoRaMacPrimitives_t mac_primitives;
 static LoRaMacCallback_t mac_callbacks;
 
 static LoRaMacEventInfoStatus_t last_mcps_confirm_status;
+/* Wait the MAC reported with the last send it refused for the duty cycle */
+static uint32_t last_duty_cycle_wait_ms;
 static LoRaMacEventInfoStatus_t last_mlme_confirm_status;
 static LoRaMacEventInfoStatus_t last_mcps_indication_status;
 static LoRaMacEventInfoStatus_t last_mlme_indication_status;
@@ -704,6 +706,11 @@ void lorawan_enable_adr(bool enable)
 	}
 }
 
+uint32_t lorawan_get_duty_cycle_wait_ms(void)
+{
+	return last_duty_cycle_wait_ms;
+}
+
 int lorawan_set_conf_msg_tries(uint8_t tries)
 {
 	MibRequestConfirm_t mib_req;
@@ -774,6 +781,9 @@ int lorawan_send(uint8_t port, uint8_t *data, uint8_t len,
 	status = LoRaMacMcpsRequest(&mcps_req);
 	/* The confirm is delivered under the MAC lock: release it first */
 	lorawan_mac_unlock();
+	last_duty_cycle_wait_ms = status == LORAMAC_STATUS_DUTYCYCLE_RESTRICTED
+					  ? (uint32_t)mcps_req.ReqReturn.DutyCycleWaitTime
+					  : 0;
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("LoRaWAN Send failed: %s", lorawan_status2str(status));
 		ret = lorawan_status2errno(status);
