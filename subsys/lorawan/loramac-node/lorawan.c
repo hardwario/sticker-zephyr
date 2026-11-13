@@ -78,6 +78,11 @@ enum {
  * join requests, even as the current datarate changes due to ADR.
  */
 static enum lorawan_datarate default_datarate;
+
+/* Sync word used for joins and all later traffic (public 0x34, private 0x12).
+ * lorawan_join() reapplies it, so it must be set before the join.
+ */
+static bool public_network = IS_ENABLED(CONFIG_LORAWAN_PUBLIC_NETWORK);
 static enum lorawan_datarate current_datarate;
 static ATOMIC_DEFINE(lorawan_flags, LORAWAN_FLAG_COUNT);
 
@@ -337,6 +342,11 @@ static LoRaMacStatus_t lorawan_join_abp(
 	return LORAMAC_STATUS_OK;
 }
 
+void lorawan_set_public_network(bool enable)
+{
+	public_network = enable;
+}
+
 int lorawan_set_region(enum lorawan_region region)
 {
 	switch (region) {
@@ -495,7 +505,7 @@ int lorawan_join(const struct lorawan_join_config *join_cfg)
 
 	/* MIB_PUBLIC_NETWORK powers on the radio and does not turn it off */
 	mib_req.Type = MIB_PUBLIC_NETWORK;
-	mib_req.Param.EnablePublicNetwork = IS_ENABLED(CONFIG_LORAWAN_PUBLIC_NETWORK);
+	mib_req.Param.EnablePublicNetwork = public_network;
 	LoRaMacMibSetRequestConfirm(&mib_req);
 
 	if (join_cfg->mode == LORAWAN_ACT_OTAA) {
