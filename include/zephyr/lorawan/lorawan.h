@@ -429,6 +429,17 @@ void lorawan_get_payload_sizes(uint8_t *max_next_payload_size,
 int lorawan_set_region(enum lorawan_region region);
 
 /**
+ * @brief Select a public or private LoRaWAN network
+ *
+ * Selects the LoRa sync word (public 0x34, private 0x12). It takes effect on
+ * the next lorawan_join(), which applies it before sending the join request.
+ * The default comes from CONFIG_LORAWAN_PUBLIC_NETWORK.
+ *
+ * @param enable true for a public network, false for a private one
+ */
+void lorawan_set_public_network(bool enable);
+
+/**
  * @brief Request for time according to DeviceTimeReq MAC cmd
  *
  * Append MAC DevTimeReq command. It will be processed on next send
