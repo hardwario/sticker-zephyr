@@ -8,6 +8,7 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/lora.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/lorawan/lorawan.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/kernel.h>
 
@@ -38,6 +39,54 @@
 
 LOG_MODULE_REGISTER(sx12xx_common, CONFIG_LORA_LOG_LEVEL);
 
+/*
+ * The radio driver below (loramac-node) is not thread-safe: every Radio.*
+ * call is a sequence of SPI transactions plus bookkeeping of the chip's
+ * operating mode. The DIO1 bottom half (the variant's IRQ work item) already
+ * runs Radio.IrqProcess() under lorawan_mac_lock(), but the lora_* API below
+ * used to drive the radio without it. A caller on its own thread (e.g. a raw
+ * LoRa P2P stack) whose receive timed out while a packet was completing
+ * could then put the radio to sleep and wake it again interleaved with the
+ * IRQ work reading and clearing the same chip, leaving the radio asleep while
+ * the driver believed it awake: BUSY stuck high and SX126xWaitOnBusy() spinning
+ * forever. Every radio access from this API therefore takes the same
+ * recursive lock. It is never held across a k_poll() wait, so the IRQ work
+ * can always complete the operation being waited for.
+ */
+#define RADIO_LOCK()   lorawan_mac_lock()
+#define RADIO_UNLOCK() lorawan_mac_unlock()
+
+/* Set by a variant after a hard radio reset; see sx12xx_request_reinit(). */
+static atomic_t reinit_pending;
+
+/* Continuous reception for the lora_* API, with the boosted LNA gain if
+ * CONFIG_LORA_RX_BOOSTED_GAIN (the SX127x has no RxBoosted).
+ */
+static void sx12xx_rx_start(void)
+{
+	if (IS_ENABLED(CONFIG_LORA_RX_BOOSTED_GAIN) && Radio.RxBoosted != NULL) {
+		Radio.RxBoosted(0);
+	} else {
+		Radio.Rx(0);
+	}
+}
+
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+volatile uint32_t sx12xx_irq_cyc;
+
+__weak void sx12xx_turnaround_begin(void)
+{
+}
+
+__weak void sx12xx_turnaround_armed(void)
+{
+}
+
+__weak void sx12xx_turnaround_end(void)
+{
+}
+#endif
+
 struct sx12xx_rx_params {
 	uint8_t *buf;
 	uint8_t *size;
@@ -63,7 +112,49 @@ static struct sx12xx_data {
 	};
 	atomic_t modem_usage;
 	struct sx12xx_rx_params rx_params;
+#if defined(CONFIG_LORA_FSK)
+	/* The last lora_config() chose (G)FSK; its packet format, and the
+	 * length a reception takes (the RX configuration's fixed length, 255
+	 * with variable length).
+	 */
+	bool fsk;
+	struct lora_fsk_config fsk_cfg;
+	uint8_t fsk_rx_len;
+#endif
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+	/* The last RX configuration, for lora_send_recv_async(). */
+	struct lora_modem_config rx_cfg;
+	/* lora_send_recv_async(): its TX is on air (turnaround), then its
+	 * reception runs (turnaround_rx); both under the radio lock.
+	 */
+	bool turnaround;
+	bool turnaround_rx;
+	lora_recv_cb turnaround_cb;
+	void *turnaround_user_data;
+	struct lora_turnaround *turnaround_timing;
+#endif
 } dev_data;
+
+#if defined(CONFIG_LORA_FSK)
+#define SX12XX_MODEM() (dev_data.fsk ? MODEM_FSK : MODEM_LORA)
+#else
+#define SX12XX_MODEM() dev_data.modem
+#endif
+
+/* Before a reception: LoRa and variable-length (G)FSK read the length from
+ * the packet; fixed-length (G)FSK takes the RX configuration's length, which
+ * a transmission (it sets its own) or a reconfiguration has replaced.
+ */
+static void sx12xx_rx_length(void)
+{
+#if defined(CONFIG_LORA_FSK)
+	if (dev_data.fsk) {
+		sx12xx_fsk_packet(&dev_data.fsk_cfg, dev_data.fsk_rx_len);
+		return;
+	}
+#endif
+	Radio.SetMaxPayloadLength(SX12XX_MODEM(), 255);
+}
 
 int __sx12xx_configure_pin(const struct gpio_dt_spec *gpio, gpio_flags_t flags)
 {
@@ -110,16 +201,43 @@ static inline bool modem_acquire(struct sx12xx_data *data)
  */
 static bool modem_release(struct sx12xx_data *data)
 {
+	RADIO_LOCK();
 	/* Increment atomic so both acquire and release will fail */
 	if (!atomic_cas(&data->modem_usage, STATE_BUSY, STATE_CLEANUP)) {
+		RADIO_UNLOCK();
 		return false;
 	}
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+	if (data->turnaround || data->turnaround_rx) {
+		data->turnaround = false;
+		data->turnaround_rx = false;
+		sx12xx_turnaround_end();
+	}
+#endif
 	/* Put radio back into sleep mode */
 	Radio.Sleep();
+	RADIO_UNLOCK();
 	/* Completely release modem */
 	data->operation_done = NULL;
 	atomic_clear(&data->modem_usage);
 	return true;
+}
+
+void sx12xx_request_reinit(void)
+{
+	atomic_set(&reinit_pending, 1);
+}
+
+/*
+ * Re-run the radio initialisation after a variant hard-reset a wedged radio.
+ * Called with the radio lock held and the modem acquired.
+ */
+static void reinit_if_pending(void)
+{
+	if (atomic_cas(&reinit_pending, 1, 0)) {
+		LOG_WRN("Re-initialising the radio after a reset");
+		Radio.Init(&dev_data.events);
+	}
 }
 
 static void sx12xx_ev_rx_done(uint8_t *payload, uint16_t size, int16_t rssi,
@@ -127,10 +245,17 @@ static void sx12xx_ev_rx_done(uint8_t *payload, uint16_t size, int16_t rssi,
 {
 	struct k_poll_signal *sig = dev_data.operation_done;
 
+#if defined(CONFIG_LORA_FSK)
+	if (dev_data.fsk) {
+		/* Before a new reception starts: no SNR in (G)FSK. */
+		rssi = sx12xx_fsk_rssi();
+		snr = 0;
+	}
+#endif
 	/* Receiving in asynchronous mode */
 	if (dev_data.async_rx_cb) {
 		/* Start receiving again */
-		Radio.Rx(0);
+		sx12xx_rx_start();
 		/* Run the callback */
 		dev_data.async_rx_cb(dev_data.dev, payload, size, rssi, snr,
 				   dev_data.async_user_data);
@@ -182,6 +307,33 @@ static void sx12xx_ev_tx_done(void)
 {
 	struct k_poll_signal *sig = dev_data.operation_done;
 
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+	if (dev_data.turnaround) {
+		/* lora_send_recv_async(): straight on into reception, the radio
+		 * neither sleeps nor waits for the caller. The DIO1 work holds
+		 * the radio lock; the RX settings were applied before the TX.
+		 */
+		uint32_t tx_done_cyc = sx12xx_irq_cyc;
+
+		dev_data.turnaround = false;
+		dev_data.turnaround_rx = true;
+		dev_data.async_rx_cb = dev_data.turnaround_cb;
+		dev_data.async_user_data = dev_data.turnaround_user_data;
+		sx12xx_rx_length();
+		sx12xx_rx_start();
+		if (dev_data.turnaround_timing) {
+			dev_data.turnaround_timing->rx_armed_cyc = k_cycle_get_32();
+			dev_data.turnaround_timing->tx_done_cyc = tx_done_cyc;
+		}
+		sx12xx_turnaround_armed();
+		dev_data.operation_done = NULL;
+		if (sig) {
+			k_poll_signal_raise(sig, 0);
+		}
+		return;
+	}
+#endif
+
 	if (modem_release(&dev_data)) {
 		/* Raise signal if provided */
 		if (sig) {
@@ -192,8 +344,19 @@ static void sx12xx_ev_tx_done(void)
 
 static void sx12xx_ev_tx_timed_out(void)
 {
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+	struct k_poll_signal *sig = dev_data.operation_done;
+	bool turnaround = dev_data.turnaround;
+
+	/* Just release the modem */
+	if (modem_release(&dev_data) && turnaround && sig) {
+		/* lora_send_recv_async() waits for this signal */
+		k_poll_signal_raise(sig, -ETIMEDOUT);
+	}
+#else
 	/* Just release the modem */
 	modem_release(&dev_data);
+#endif
 }
 
 static void sx12xx_ev_rx_error(void)
@@ -203,7 +366,7 @@ static void sx12xx_ev_rx_error(void)
 	/* Receiving in asynchronous mode */
 	if (dev_data.async_rx_cb) {
 		/* Start receiving again */
-		Radio.Rx(0);
+		sx12xx_rx_start();
 		/* Don't run the synchronous code */
 		return;
 	}
@@ -249,6 +412,18 @@ static int sx12xx_get_bandwidth_idx(enum lora_signal_bandwidth bandwidth,
 uint32_t sx12xx_airtime(const struct device *dev, uint32_t data_len)
 {
 	uint32_t bw_idx;
+
+#if defined(CONFIG_LORA_FSK)
+	if (dev_data.fsk) {
+		const struct lora_fsk_config *f = &dev_data.fsk_cfg;
+		bool no_len = f->fixed_len != 0U || f->sw_length;
+		uint32_t bytes = f->preamble_len + f->sync_word_len + (no_len ? 0U : 1U) +
+				 data_len + (f->crc != LORA_FSK_CRC_OFF ? 2U : 0U);
+
+		/* A short packet is mostly the radio's own start-up: margin. */
+		return DIV_ROUND_UP(bytes * 8U * 1000U, f->bitrate) + 10U;
+	}
+#endif
 
 #ifdef SX12XX_GFSK
 	if (dev_data.modem == MODEM_FSK) {
@@ -353,12 +528,110 @@ int sx12xx_lora_send_async(const struct device *dev, uint8_t *data,
 	/* Store signal */
 	dev_data.operation_done = async;
 
-	Radio.SetMaxPayloadLength(dev_data.modem, data_len);
+	RADIO_LOCK();
+	reinit_if_pending();
+	Radio.SetMaxPayloadLength(SX12XX_MODEM(), data_len);
 
 	Radio.Send(data, data_len);
+	RADIO_UNLOCK();
 
 	return 0;
 }
+
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+/* One modulation both ways: the RX settings applied before the TX replace the
+ * packet parameters the transmission uses as well.
+ */
+static bool sx12xx_same_modulation(const struct lora_modem_config *a,
+				   const struct lora_modem_config *b)
+{
+#if defined(CONFIG_LORA_FSK)
+	if (a->modem != b->modem) {
+		return false;
+	}
+	if (a->modem == LORA_MODEM_FSK) {
+		return a->fsk.bitrate == b->fsk.bitrate && a->fsk.fdev == b->fsk.fdev &&
+		       (a->fsk.fixed_len == 0U) == (b->fsk.fixed_len == 0U) &&
+		       a->fsk.sw_length == b->fsk.sw_length;
+	}
+#endif
+	return a->bandwidth == b->bandwidth && a->datarate == b->datarate &&
+	       a->coding_rate == b->coding_rate && a->preamble_len == b->preamble_len &&
+	       a->iq_inverted == b->iq_inverted && a->public_network == b->public_network;
+}
+
+int sx12xx_lora_send_recv_async(const struct device *dev, uint8_t *data, uint32_t data_len,
+				lora_recv_cb cb, void *user_data, struct k_poll_signal *tx_done,
+				struct lora_turnaround *timing)
+{
+	const struct lora_modem_config *tx = &dev_data.tx_cfg;
+	const struct lora_modem_config *rx = &dev_data.rx_cfg;
+	uint32_t bw_idx;
+
+	/* One modulation both ways: the RX settings applied below replace the
+	 * packet parameters the transmission uses as well.
+	 */
+	if (cb == NULL || !tx->frequency || rx->frequency != tx->frequency ||
+	    !sx12xx_same_modulation(rx, tx)) {
+		return -EINVAL;
+	}
+
+	/* Not after lora_config_gfsk(); the library takes a LoRa bandwidth
+	 * index, not the kHz enum.
+	 */
+	if (dev_data.modem != MODEM_LORA) {
+		return -EINVAL;
+	}
+	if (SX12XX_MODEM() == MODEM_FSK) {
+		bw_idx = 0;
+	} else if (sx12xx_get_bandwidth_idx(rx->bandwidth, &bw_idx) < 0) {
+		return -EINVAL;
+	}
+
+	if (!modem_acquire(&dev_data)) {
+		return -EBUSY;
+	}
+
+	dev_data.operation_done = tx_done;
+	dev_data.turnaround_cb = cb;
+	dev_data.turnaround_user_data = user_data;
+	dev_data.turnaround_timing = timing;
+
+	RADIO_LOCK();
+	reinit_if_pending();
+	sx12xx_turnaround_begin();
+	/* The RX-only settings (continuous mode, symbol timeout, IQ register)
+	 * now, so that TX-done only has to set the payload length, the IRQ mask
+	 * and SetRx. The packet parameters are shared with the transmission
+	 * below, so the CRC is on as sx12xx_lora_config() sets it for TX; the
+	 * receiver takes the CRC presence from the explicit header either way.
+	 */
+#if defined(CONFIG_LORA_FSK)
+	if (dev_data.fsk) {
+		/* Same packet format both ways (checked above); the TX sets
+		 * its length, TX-done sets the RX one.
+		 */
+		Radio.SetRxConfig(MODEM_FSK, rx->fsk.bandwidth / 2U, rx->fsk.bitrate, 0,
+				  rx->fsk.bandwidth / 2U, rx->fsk.preamble_len, 0,
+				  rx->fsk.fixed_len != 0U || rx->fsk.sw_length, rx->fsk.fixed_len,
+				  rx->fsk.crc != LORA_FSK_CRC_OFF, 0, 0, false, false);
+		sx12xx_fsk_packet(&rx->fsk, data_len);
+	} else {
+#else
+	{
+#endif
+		Radio.SetRxConfig(MODEM_LORA, bw_idx, rx->datarate, rx->coding_rate, 0,
+				  rx->preamble_len, 10, false, 0, !tx->packet_crc_disable, 0, 0,
+				  rx->iq_inverted, true);
+	}
+	Radio.SetMaxPayloadLength(SX12XX_MODEM(), data_len);
+	dev_data.turnaround = true;
+	Radio.Send(data, data_len);
+	RADIO_UNLOCK();
+
+	return 0;
+}
+#endif
 
 int sx12xx_lora_recv(const struct device *dev, uint8_t *data, uint8_t size,
 		     k_timeout_t timeout, int16_t *rssi, int8_t *snr)
@@ -384,8 +657,11 @@ int sx12xx_lora_recv(const struct device *dev, uint8_t *data, uint8_t size,
 	dev_data.rx_params.rssi = rssi;
 	dev_data.rx_params.snr = snr;
 
-	Radio.SetMaxPayloadLength(dev_data.modem, 255);
-	Radio.Rx(0);
+	RADIO_LOCK();
+	reinit_if_pending();
+	sx12xx_rx_length();
+	sx12xx_rx_start();
+	RADIO_UNLOCK();
 
 	ret = k_poll(&evt, 1, timeout);
 	if (ret < 0) {
@@ -432,8 +708,11 @@ int sx12xx_lora_recv_async(const struct device *dev, lora_recv_cb cb, void *user
 	dev_data.async_user_data = user_data;
 
 	/* Start reception */
-	Radio.SetMaxPayloadLength(dev_data.modem, 255);
-	Radio.Rx(0);
+	RADIO_LOCK();
+	reinit_if_pending();
+	sx12xx_rx_length();
+	sx12xx_rx_start();
+	RADIO_UNLOCK();
 
 	return 0;
 }
@@ -442,10 +721,16 @@ int sx12xx_lora_config(const struct device *dev,
 		       const struct lora_modem_config *config)
 {
 	bool crc = !config->packet_crc_disable;
-	uint32_t bw_idx;
-	int ret;
+	uint32_t bw_idx = 0;
+	int ret = 0;
 
-	ret = sx12xx_get_bandwidth_idx(config->bandwidth, &bw_idx);
+#if defined(CONFIG_LORA_FSK)
+	/* (G)FSK does not use the LoRa bandwidth */
+	if (config->modem != LORA_MODEM_FSK)
+#endif
+	{
+		ret = sx12xx_get_bandwidth_idx(config->bandwidth, &bw_idx);
+	}
 	if (ret < 0) {
 		LOG_ERR("Unsupported bandwidth: %d", config->bandwidth);
 		return ret;
@@ -456,12 +741,55 @@ int sx12xx_lora_config(const struct device *dev,
 		return -EBUSY;
 	}
 
+	RADIO_LOCK();
+	reinit_if_pending();
 	Radio.SetChannel(config->frequency);
-	dev_data.modem = MODEM_LORA;
 	/* The configurations share storage, so drop whatever the other
-	 * modem left behind
+	 * modem left behind. An RX configuration of the same modem keeps the
+	 * TX one: lora_send_recv_async() and a lora_send() after a receive
+	 * need it (upstream v4.5 cleared it on every call).
 	 */
-	memset(&dev_data.tx_cfg, 0, sizeof(dev_data.tx_cfg));
+	if (dev_data.modem != MODEM_LORA) {
+		memset(&dev_data.tx_cfg, 0, sizeof(dev_data.tx_cfg));
+	}
+	dev_data.modem = MODEM_LORA;
+
+#if defined(CONFIG_LORA_FSK)
+	dev_data.fsk = config->modem == LORA_MODEM_FSK;
+	if (dev_data.fsk) {
+		const struct lora_fsk_config *f = &config->fsk;
+		bool fixed = f->fixed_len != 0U || f->sw_length;
+
+		if (config->tx) {
+			memcpy(&dev_data.tx_cfg, config, sizeof(dev_data.tx_cfg));
+			/* The RX bandwidth too: the modulation parameters are
+			 * shared, and a reception may follow without a new
+			 * RX configuration.
+			 */
+			Radio.SetTxConfig(MODEM_FSK, config->tx_power, f->fdev, f->bandwidth / 2U,
+					  f->bitrate, 0, f->preamble_len, fixed,
+					  f->crc != LORA_FSK_CRC_OFF, 0, 0, false, 4000);
+		} else {
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+			memcpy(&dev_data.rx_cfg, config, sizeof(dev_data.rx_cfg));
+#endif
+			dev_data.fsk_rx_len = f->fixed_len != 0U ? f->fixed_len : 255U;
+			Radio.SetRxConfig(MODEM_FSK, f->bandwidth / 2U, f->bitrate, 0,
+					  f->bandwidth / 2U, f->preamble_len, 0, fixed,
+					  f->fixed_len, f->crc != LORA_FSK_CRC_OFF, 0, 0, false,
+					  false);
+		}
+		dev_data.fsk_cfg = *f;
+		/* SetTx/RxConfig() reset the sync word, CRC and whitening. A
+		 * transmission sets its own length.
+		 */
+		sx12xx_fsk_packet(f, config->tx ? 255U : dev_data.fsk_rx_len);
+		RADIO_UNLOCK();
+		modem_release(&dev_data);
+		return 0;
+	}
+	sx12xx_fsk_off();
+#endif
 
 	if (config->tx) {
 		/* Store TX config locally for airtime calculations */
@@ -472,6 +800,10 @@ int sx12xx_lora_config(const struct device *dev,
 				  config->coding_rate, config->preamble_len,
 				  false, crc, 0, 0, config->iq_inverted, 4000);
 	} else {
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+		/* Kept for lora_send_recv_async() */
+		memcpy(&dev_data.rx_cfg, config, sizeof(dev_data.rx_cfg));
+#endif
 		/* TODO: Get symbol timeout value from config parameters */
 		Radio.SetRxConfig(MODEM_LORA, bw_idx,
 				  config->datarate, config->coding_rate,
@@ -484,6 +816,7 @@ int sx12xx_lora_config(const struct device *dev,
 		LOG_WRN_ONCE("loramac-node doesn't support custom SYNC words");
 	}
 	Radio.SetPublicNetwork(config->public_network);
+	RADIO_UNLOCK();
 
 	modem_release(&dev_data);
 	return 0;
@@ -548,6 +881,8 @@ int sx12xx_lora_config_gfsk(const struct device *dev, const struct lora_modem_co
 		return -EBUSY;
 	}
 
+	RADIO_LOCK();
+	reinit_if_pending();
 	Radio.SetChannel(config->frequency);
 	dev_data.modem = MODEM_FSK;
 	/* The configurations share storage, so drop whatever the other
@@ -566,6 +901,7 @@ int sx12xx_lora_config_gfsk(const struct device *dev, const struct lora_modem_co
 				  config->preamble_len, 0, config->fixed_len, config->payload_len,
 				  crc, false, 0, false, true);
 	}
+	RADIO_UNLOCK();
 
 	modem_release(&dev_data);
 	return 0;
@@ -581,7 +917,10 @@ int sx12xx_lora_test_cw(const struct device *dev, uint32_t frequency,
 		return -EBUSY;
 	}
 
+	RADIO_LOCK();
+	reinit_if_pending();
 	Radio.SetTxContinuousWave(frequency, tx_power, duration);
+	RADIO_UNLOCK();
 	return 0;
 }
 
@@ -593,7 +932,9 @@ int sx12xx_lora_rssi(const struct device *dev, int16_t *rssi)
 	 * already in progress. The bus access itself is serialised one layer
 	 * down.
 	 */
+	RADIO_LOCK();
 	*rssi = Radio.Rssi(dev_data.modem);
+	RADIO_UNLOCK();
 
 	return 0;
 }

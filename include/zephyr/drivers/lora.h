@@ -90,6 +90,77 @@ enum lora_coding_rate {
 	CR_4_8 = 4,  /**< Coding rate 4/8 (4 information bits, 4 error correction bits) */
 };
 
+#if defined(CONFIG_LORA_FSK) || defined(__DOXYGEN__)
+/**
+ * @brief Modem used by lora_config() (CONFIG_LORA_FSK)
+ */
+enum lora_modem_type {
+	LORA_MODEM_LORA = 0, /**< LoRa, the default of a zeroed configuration */
+	LORA_MODEM_FSK,      /**< (G)FSK, set by @ref lora_fsk_config */
+};
+
+/**
+ * @brief Packet CRC of the (G)FSK modem (CONFIG_LORA_FSK)
+ */
+enum lora_fsk_crc {
+	LORA_FSK_CRC_OFF = 0,     /**< No CRC */
+	LORA_FSK_CRC_2_BYTES,     /**< 16-bit CRC as computed */
+	LORA_FSK_CRC_2_BYTES_INV, /**< 16-bit CRC, sent inverted */
+};
+
+/**
+ * @brief (G)FSK modem parameters (CONFIG_LORA_FSK)
+ *
+ * The packet is preamble, sync word, a length byte unless @ref fixed_len,
+ * the payload and the CRC. Whitening covers the length byte, the payload
+ * and the CRC.
+ */
+struct lora_fsk_config {
+	/** Bit rate in bit/s */
+	uint32_t bitrate;
+	/** Frequency deviation in Hz */
+	uint32_t fdev;
+	/** Receiver bandwidth in Hz, double-sided; the radio takes its
+	 *  nearest step at or above it
+	 */
+	uint32_t bandwidth;
+	/** Preamble length in bytes */
+	uint16_t preamble_len;
+	/** Sync word, first byte sent first */
+	uint8_t sync_word[8];
+	/** Sync word length in bytes, 1..8 */
+	uint8_t sync_word_len;
+	/** 0: variable length (length byte after the sync word); otherwise
+	 *  fixed-length packets: a reception takes this many bytes, a
+	 *  transmission sends the bytes it is given
+	 */
+	uint8_t fixed_len;
+	/** Packet CRC */
+	enum lora_fsk_crc crc;
+	/** CRC initial value */
+	uint16_t crc_seed;
+	/** CRC polynomial */
+	uint16_t crc_poly;
+	/** Whitening on */
+	bool whitening;
+	/** Whitening LFSR initial value (9 bits) */
+	uint16_t whitening_seed;
+	/** Length in software, for a peer whose whitening or CRC the radio
+	 *  cannot reproduce (radio whitening and CRC off, the caller frames
+	 *  the packet): the packet has no length byte the radio reads, a
+	 *  transmission sends the bytes it is given, and a reception reads
+	 *  the first payload byte as it arrives and ends the packet after
+	 *  (byte ^ @ref len_xor) + @ref len_extra more bytes. With
+	 *  @ref fixed_len 0 only.
+	 */
+	bool sw_length;
+	/** Mask of the first payload byte, see @ref sw_length */
+	uint8_t len_xor;
+	/** Bytes after those the length byte counts, see @ref sw_length */
+	uint8_t len_extra;
+};
+#endif
+
 /**
  * @brief Number of symbols used for Channel Activity Detection
  *
@@ -296,6 +367,15 @@ struct lora_modem_config {
 		 */
 		uint8_t detection_minimum;
 	} cad;
+#if defined(CONFIG_LORA_FSK) || defined(__DOXYGEN__)
+	/** Modem: LoRa (default) or (G)FSK. With (G)FSK only frequency,
+	 *  tx_power, tx and @ref fsk are used.
+	 */
+	enum lora_modem_type modem;
+
+	/** (G)FSK parameters, used with LORA_MODEM_FSK */
+	struct lora_fsk_config fsk;
+#endif
 };
 
 /**
@@ -428,6 +508,28 @@ typedef int (*lora_api_recv_duty_cycle_async)(const struct device *dev,
 					      lora_recv_cb cb, void *user_data);
 
 /**
+ * @brief Turnaround timing of lora_send_recv_async(), in k_cycle_get_32() units.
+ */
+struct lora_turnaround {
+	/** The radio's TX-done interrupt. */
+	uint32_t tx_done_cyc;
+	/** Reception running (SetRx accepted by the radio). */
+	uint32_t rx_armed_cyc;
+};
+
+/**
+ * @typedef lora_api_send_recv_async()
+ * @brief Callback API for a transmission followed at once by reception
+ *
+ * @see lora_send_recv_async() for argument descriptions.
+ */
+typedef int (*lora_api_send_recv_async)(const struct device *dev, uint8_t *data,
+					uint32_t data_len, lora_recv_cb cb, void *user_data,
+					struct k_poll_signal *tx_done,
+					struct lora_turnaround *timing);
+
+/**
+ * @typedef lora_api_test_cw()
  * @brief Callback API for transmitting a continuous wave
  *
  * @see lora_test_cw() for argument descriptions.
@@ -465,6 +567,9 @@ __subsystem struct lora_driver_api {
 	lora_api_recv_duty_cycle recv_duty_cycle;
 	/** @driver_ops_optional @copybrief lora_test_cw */
 	lora_api_test_cw test_cw;
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+	lora_api_send_recv_async send_recv_async;
+#endif
 };
 
 /** @} */
@@ -783,6 +888,45 @@ static inline int lora_recv_duty_cycle_async(const struct device *dev,
 
 	return api->recv_duty_cycle_async(dev, rx_period, sleep_period, cb, user_data);
 }
+
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+/**
+ * @brief Transmit, then receive asynchronously with no radio sleep in between
+ *
+ * Sends like lora_send_async() with the TX configuration, and on the radio's
+ * TX-done interrupt switches it straight to continuous reception, as
+ * lora_recv_async() would, without putting it to sleep or waiting for the
+ * caller. Reception uses the RX configuration of the last lora_config() call
+ * with @a tx false, which must be on the same frequency as the TX one; only
+ * the RX-specific settings of that configuration are applied, before the
+ * transmission. Stop the reception with lora_recv_async(dev, NULL, NULL).
+ * Needs CONFIG_LORA_SEND_RECV_ASYNC.
+ *
+ * @param dev      LoRa device
+ * @param data     Data to be sent
+ * @param data_len Length of the data to be sent
+ * @param cb       Callback for every packet received, as for lora_recv_async()
+ * @param user_data User data passed to @a cb
+ * @param tx_done  Raised once the transmission ended: result 0 with reception
+ *                 running, or a negative error code (the modem is released)
+ * @param timing   Optional turnaround timestamps, valid once @a tx_done is 0
+ * @return 0 when the transmission started, -EBUSY if the modem is in use,
+ *         -EINVAL without matching TX and RX configurations, -ENOSYS if the
+ *         driver lacks this call
+ */
+static inline int lora_send_recv_async(const struct device *dev, uint8_t *data,
+				       uint32_t data_len, lora_recv_cb cb, void *user_data,
+				       struct k_poll_signal *tx_done,
+				       struct lora_turnaround *timing)
+{
+	const struct lora_driver_api *api = (const struct lora_driver_api *)dev->api;
+
+	if (api->send_recv_async == NULL) {
+		return -ENOSYS;
+	}
+	return api->send_recv_async(dev, data, data_len, cb, user_data, tx_done, timing);
+}
+#endif /* CONFIG_LORA_SEND_RECV_ASYNC */
 
 /**
  * @brief Transmit an unmodulated continuous wave at a given frequency

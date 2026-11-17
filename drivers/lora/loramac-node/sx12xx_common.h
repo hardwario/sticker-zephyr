@@ -32,6 +32,11 @@ int sx12xx_lora_recv(const struct device *dev, uint8_t *data, uint8_t size,
 int sx12xx_lora_recv_async(const struct device *dev, lora_recv_cb cb, void *user_data);
 
 uint32_t sx12xx_airtime(const struct device *dev, uint32_t data_len);
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+int sx12xx_lora_send_recv_async(const struct device *dev, uint8_t *data, uint32_t data_len,
+				lora_recv_cb cb, void *user_data, struct k_poll_signal *tx_done,
+				struct lora_turnaround *timing);
+#endif
 
 int sx12xx_lora_config(const struct device *dev,
 		       const struct lora_modem_config *config);
@@ -45,6 +50,46 @@ int sx12xx_lora_test_cw(const struct device *dev, uint32_t frequency,
 			uint16_t duration);
 
 int sx12xx_lora_rssi(const struct device *dev, int16_t *rssi);
+
+/*
+ * Ask the common layer to re-run Radio.Init() before the next API operation:
+ * called by a variant after it had to hard-reset a wedged radio (the reset
+ * drops the TCXO, regulator and calibration setup Radio.Init() programs).
+ */
+void sx12xx_request_reinit(void);
+
+#if defined(CONFIG_LORA_SEND_RECV_ASYNC)
+/*
+ * lora_send_recv_async() turnaround hooks of a variant, called with the radio
+ * lock held (weak no-ops in sx12xx_common.c): begin before the transmission,
+ * armed once reception runs after it, end with the radio still awake before
+ * it is put to sleep again (or when the operation is abandoned).
+ */
+void sx12xx_turnaround_begin(void);
+void sx12xx_turnaround_armed(void);
+void sx12xx_turnaround_end(void);
+
+/* k_cycle_get_32() at the radio's last DIO interrupt, set by the variant's ISR. */
+extern volatile uint32_t sx12xx_irq_cyc;
+#endif
+
+#if defined(CONFIG_LORA_FSK)
+/*
+ * Implemented by the variant: (re)write the GFSK packet parameters, sync word,
+ * CRC and whitening of cfg, with payload_len as the length a reception takes
+ * (its maximum with variable length). Called with the radio lock held, after
+ * every Radio.SetTxConfig()/SetRxConfig(), which reset them.
+ */
+void sx12xx_fsk_packet(const struct lora_fsk_config *cfg, uint8_t payload_len);
+
+/* Implemented by the variant: the radio was configured for LoRa. */
+void sx12xx_fsk_off(void);
+
+/* Implemented by the variant: RSSI (dBm) of the (G)FSK packet just received;
+ * Radio.RxDone() passes the last LoRa packet's.
+ */
+int16_t sx12xx_fsk_rssi(void);
+#endif
 
 int sx12xx_init(const struct device *dev);
 

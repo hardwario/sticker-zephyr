@@ -115,6 +115,10 @@ static int ds2484_init(const struct device *dev)
 	const struct ds2484_config *config = dev->config;
 	struct ds2484_data *data = dev->data;
 
+	/* w1_lock_bus() uses this mutex; a zeroed k_mutex has an invalid wait queue,
+	 * so a contending waiter is never woken (lost wakeup). */
+	k_mutex_init(&data->w1_data.bus_lock);
+
 	if (config->slpz_spec.port) {
 		if (!gpio_is_ready_dt(&config->slpz_spec)) {
 			LOG_ERR("Port (SLPZ) not ready");

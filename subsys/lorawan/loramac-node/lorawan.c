@@ -52,6 +52,11 @@
 /* Use version 1.0.3.0 for ABP */
 #define LORAWAN_ABP_VERSION 0x01000300
 
+/* Bounded wait for the MLME/MCPS confirm of a join or send request */
+#define LORAWAN_CONFIRM_TIMEOUT                                                        \
+	(CONFIG_LORAWAN_CONFIRM_TIMEOUT_MS == 0 ? K_FOREVER                            \
+						: K_MSEC(CONFIG_LORAWAN_CONFIRM_TIMEOUT_MS))
+
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(lorawan, CONFIG_LORAWAN_LOG_LEVEL);
 
@@ -73,6 +78,11 @@ enum {
  * join requests, even as the current datarate changes due to ADR.
  */
 static enum lorawan_datarate default_datarate;
+
+/* Sync word used for joins and all later traffic (public 0x34, private 0x12).
+ * lorawan_join() reapplies it, so it must be set before the join.
+ */
+static bool public_network = IS_ENABLED(CONFIG_LORAWAN_PUBLIC_NETWORK);
 static enum lorawan_datarate current_datarate;
 static ATOMIC_DEFINE(lorawan_flags, LORAWAN_FLAG_COUNT);
 
@@ -82,6 +92,8 @@ static LoRaMacPrimitives_t mac_primitives;
 static LoRaMacCallback_t mac_callbacks;
 
 static LoRaMacEventInfoStatus_t last_mcps_confirm_status;
+/* Wait the MAC reported with the last send it refused for the duty cycle */
+static uint32_t last_duty_cycle_wait_ms;
 static LoRaMacEventInfoStatus_t last_mlme_confirm_status;
 static LoRaMacEventInfoStatus_t last_mcps_indication_status;
 static LoRaMacEventInfoStatus_t last_mlme_indication_status;
@@ -112,7 +124,9 @@ static uint8_t get_battery_level(void)
 
 static void mac_process_notify(void)
 {
+	lorawan_mac_lock();
 	LoRaMacProcess();
+	lorawan_mac_unlock();
 }
 
 static void datarate_observe(bool force_notification)
@@ -120,7 +134,9 @@ static void datarate_observe(bool force_notification)
 	MibRequestConfirm_t mib_req;
 
 	mib_req.Type = MIB_CHANNELS_DATARATE;
+	lorawan_mac_lock();
 	LoRaMacMibGetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
 
 	if ((mib_req.Param.ChannelsDatarate != current_datarate) ||
 	    (force_notification)) {
@@ -227,8 +243,16 @@ static void mlme_confirm_handler(MlmeConfirm_t *mlme_confirm)
 	}
 
 out_sem:
-	last_mlme_confirm_status = mlme_confirm->Status;
-	k_sem_give(&mlme_confirm_sem);
+	/*
+	 * Only lorawan_join() waits for an MLME confirm. Link check and device
+	 * time requests are fire-and-forget, so signalling their confirms would
+	 * leave a stale token (and a stale status) in mlme_confirm_sem and make
+	 * the next lorawan_join() return immediately with the wrong result.
+	 */
+	if (mlme_confirm->MlmeRequest == MLME_JOIN) {
+		last_mlme_confirm_status = mlme_confirm->Status;
+		k_sem_give(&mlme_confirm_sem);
+	}
 }
 
 static void mlme_indication_handler(MlmeIndication_t *mlme_indication)
@@ -316,6 +340,11 @@ static LoRaMacStatus_t lorawan_join_abp(
 	LoRaMacMibSetRequestConfirm(&mib_req);
 
 	return LORAMAC_STATUS_OK;
+}
+
+void lorawan_set_public_network(bool enable)
+{
+	public_network = enable;
 }
 
 int lorawan_set_region(enum lorawan_region region)
@@ -409,7 +438,9 @@ int lorawan_request_link_check(bool force_request)
 	MlmeReq_t mlme_req;
 
 	mlme_req.Type = MLME_LINK_CHECK;
+	lorawan_mac_lock();
 	status = LoRaMacMlmeRequest(&mlme_req);
+	lorawan_mac_unlock();
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("LinkCheckReq failed: %s", lorawan_status2str(status));
 		ret = lorawan_status2errno(status);
@@ -430,7 +461,9 @@ int lorawan_request_device_time(bool force_request)
 	MlmeReq_t mlme_req;
 
 	mlme_req.Type = MLME_DEVICE_TIME;
+	lorawan_mac_lock();
 	status = LoRaMacMlmeRequest(&mlme_req);
+	lorawan_mac_unlock();
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("DeviceTime Req. failed: %s", lorawan_status2str(status));
 		ret = lorawan_status2errno(status);
@@ -454,7 +487,9 @@ int lorawan_device_time_get(uint32_t *gps_time)
 		return -EAGAIN;
 	}
 
+	lorawan_mac_lock();
 	local_time = SysTimeGet();
+	lorawan_mac_unlock();
 	*gps_time = local_time.Seconds - UNIX_GPS_EPOCH_OFFSET;
 	return 0;
 }
@@ -466,14 +501,19 @@ int lorawan_join(const struct lorawan_join_config *join_cfg)
 	int ret = 0;
 
 	k_mutex_lock(&lorawan_join_mutex, K_FOREVER);
+	lorawan_mac_lock();
 
 	/* MIB_PUBLIC_NETWORK powers on the radio and does not turn it off */
 	mib_req.Type = MIB_PUBLIC_NETWORK;
-	mib_req.Param.EnablePublicNetwork = IS_ENABLED(CONFIG_LORAWAN_PUBLIC_NETWORK);
+	mib_req.Param.EnablePublicNetwork = public_network;
 	LoRaMacMibSetRequestConfirm(&mib_req);
 
 	if (join_cfg->mode == LORAWAN_ACT_OTAA) {
+		/* Drop a confirm left over from an earlier join whose wait ended */
+		k_sem_reset(&mlme_confirm_sem);
 		status = lorawan_join_otaa(join_cfg);
+		/* The confirm is delivered under the MAC lock: release it first */
+		lorawan_mac_unlock();
 		if (status != LORAMAC_STATUS_OK) {
 			LOG_ERR("OTAA join failed: %s",
 				lorawan_status2str(status));
@@ -484,17 +524,22 @@ int lorawan_join(const struct lorawan_join_config *join_cfg)
 		LOG_DBG("Network join request sent!");
 
 		/*
-		 * We can be sure that the semaphore will be released for
-		 * both success and failure cases after a specific time period.
-		 * So we can use K_FOREVER and no need to check the return val.
+		 * LoRaMac reports the join result (success or failure) once the
+		 * RX windows have closed. Bound the wait anyway, so a lost
+		 * confirm cannot block the calling thread forever.
 		 */
-		k_sem_take(&mlme_confirm_sem, K_FOREVER);
+		if (k_sem_take(&mlme_confirm_sem, LORAWAN_CONFIRM_TIMEOUT) != 0) {
+			LOG_ERR("Join confirm timeout");
+			ret = -ETIMEDOUT;
+			goto out;
+		}
 		if (last_mlme_confirm_status != LORAMAC_EVENT_INFO_STATUS_OK) {
 			ret = lorawan_eventinfo2errno(last_mlme_confirm_status);
 			goto out;
 		}
 	} else if (join_cfg->mode == LORAWAN_ACT_ABP) {
 		status = lorawan_join_abp(join_cfg);
+		lorawan_mac_unlock();
 		if (status != LORAMAC_STATUS_OK) {
 			LOG_ERR("ABP join failed: %s",
 				lorawan_status2str(status));
@@ -502,6 +547,7 @@ int lorawan_join(const struct lorawan_join_config *join_cfg)
 			goto out;
 		}
 	} else {
+		lorawan_mac_unlock();
 		ret = -EINVAL;
 	}
 
@@ -522,7 +568,9 @@ out:
 
 			mib_req2.Type = MIB_CHANNELS_DATARATE;
 			mib_req2.Param.ChannelsDatarate = default_datarate;
+			lorawan_mac_lock();
 			LoRaMacMibSetRequestConfirm(&mib_req2);
+			lorawan_mac_unlock();
 		}
 
 		/*
@@ -543,7 +591,9 @@ int lorawan_set_class(enum lorawan_class dev_class)
 	LoRaMacStatus_t status;
 
 	mib_req.Type = MIB_DEVICE_CLASS;
+	lorawan_mac_lock();
 	LoRaMacMibGetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
 	current_class = mib_req.Param.Class;
 
 	switch (dev_class) {
@@ -561,7 +611,9 @@ int lorawan_set_class(enum lorawan_class dev_class)
 	}
 
 	if (mib_req.Param.Class != current_class) {
+		lorawan_mac_lock();
 		status = LoRaMacMibSetRequestConfirm(&mib_req);
+		lorawan_mac_unlock();
 		if (status != LORAMAC_STATUS_OK) {
 			LOG_ERR("Failed to set device class: %s",
 				lorawan_status2str(status));
@@ -575,6 +627,7 @@ int lorawan_set_class(enum lorawan_class dev_class)
 int lorawan_set_channels_mask(uint16_t *channels_mask, size_t channels_mask_size)
 {
 	MibRequestConfirm_t mib_req;
+	LoRaMacStatus_t status;
 
 	if ((channels_mask == NULL) || (channels_mask_size != region_channels_mask_size)) {
 		return -EINVAL;
@@ -584,7 +637,10 @@ int lorawan_set_channels_mask(uint16_t *channels_mask, size_t channels_mask_size
 	mib_req.Type = MIB_CHANNELS_MASK;
 	mib_req.Param.ChannelsMask = channels_mask;
 
-	if (LoRaMacMibSetRequestConfirm(&mib_req) != LORAMAC_STATUS_OK) {
+	lorawan_mac_lock();
+	status = LoRaMacMibSetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
+	if (status != LORAMAC_STATUS_OK) {
 		/* Channels mask is invalid for this region. */
 		return -EINVAL;
 	}
@@ -595,6 +651,7 @@ int lorawan_set_channels_mask(uint16_t *channels_mask, size_t channels_mask_size
 int lorawan_set_datarate(enum lorawan_datarate dr)
 {
 	MibRequestConfirm_t mib_req;
+	LoRaMacStatus_t status;
 
 	/* Bail out if using ADR */
 	if (atomic_test_bit(lorawan_flags, LORAWAN_FLAG_ADR_ENABLE)) {
@@ -604,7 +661,10 @@ int lorawan_set_datarate(enum lorawan_datarate dr)
 	/* Notify MAC layer of the requested datarate */
 	mib_req.Type = MIB_CHANNELS_DATARATE;
 	mib_req.Param.ChannelsDatarate = dr;
-	if (LoRaMacMibSetRequestConfirm(&mib_req) != LORAMAC_STATUS_OK) {
+	lorawan_mac_lock();
+	status = LoRaMacMibSetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
+	if (status != LORAMAC_STATUS_OK) {
 		/* Datarate is invalid for this region */
 		return -EINVAL;
 	}
@@ -621,7 +681,9 @@ void lorawan_get_payload_sizes(uint8_t *max_next_payload_size,
 	LoRaMacTxInfo_t tx_info;
 
 	/* QueryTxPossible cannot fail */
+	lorawan_mac_lock();
 	(void) LoRaMacQueryTxPossible(0, &tx_info);
+	lorawan_mac_unlock();
 
 	*max_next_payload_size = tx_info.MaxPossibleApplicationDataSize;
 	*max_payload_size = tx_info.CurrentPossiblePayloadSize;
@@ -632,7 +694,9 @@ enum lorawan_datarate lorawan_get_min_datarate(void)
 	MibRequestConfirm_t mib_req;
 
 	mib_req.Type = MIB_CHANNELS_MIN_TX_DATARATE;
+	lorawan_mac_lock();
 	LoRaMacMibGetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
 
 	return mib_req.Param.ChannelsMinTxDatarate;
 }
@@ -646,17 +710,28 @@ void lorawan_enable_adr(bool enable)
 
 		mib_req.Type = MIB_ADR;
 		mib_req.Param.AdrEnable = atomic_test_bit(lorawan_flags, LORAWAN_FLAG_ADR_ENABLE);
+		lorawan_mac_lock();
 		LoRaMacMibSetRequestConfirm(&mib_req);
+		lorawan_mac_unlock();
 	}
+}
+
+uint32_t lorawan_get_duty_cycle_wait_ms(void)
+{
+	return last_duty_cycle_wait_ms;
 }
 
 int lorawan_set_conf_msg_tries(uint8_t tries)
 {
 	MibRequestConfirm_t mib_req;
+	LoRaMacStatus_t status;
 
 	mib_req.Type = MIB_CHANNELS_NB_TRANS;
 	mib_req.Param.ChannelsNbTrans = tries;
-	if (LoRaMacMibSetRequestConfirm(&mib_req) != LORAMAC_STATUS_OK) {
+	lorawan_mac_lock();
+	status = LoRaMacMibSetRequestConfirm(&mib_req);
+	lorawan_mac_unlock();
+	if (status != LORAMAC_STATUS_OK) {
 		return -EINVAL;
 	}
 
@@ -677,6 +752,7 @@ int lorawan_send(uint8_t port, uint8_t *data, uint8_t len,
 	}
 
 	k_mutex_lock(&lorawan_send_mutex, K_FOREVER);
+	lorawan_mac_lock();
 
 	status = LoRaMacQueryTxPossible(len, &tx_info);
 	if (status != LORAMAC_STATUS_OK) {
@@ -710,7 +786,14 @@ int lorawan_send(uint8_t port, uint8_t *data, uint8_t len,
 		mcps_req.Req.Unconfirmed.Datarate = current_datarate;
 	}
 
+	/* Drop a confirm left over from an earlier send whose wait timed out */
+	k_sem_reset(&mcps_confirm_sem);
 	status = LoRaMacMcpsRequest(&mcps_req);
+	/* The confirm is delivered under the MAC lock: release it first */
+	lorawan_mac_unlock();
+	last_duty_cycle_wait_ms = status == LORAMAC_STATUS_DUTYCYCLE_RESTRICTED
+					  ? (uint32_t)mcps_req.ReqReturn.DutyCycleWaitTime
+					  : 0;
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("LoRaWAN Send failed: %s", lorawan_status2str(status));
 		ret = lorawan_status2errno(status);
@@ -718,12 +801,16 @@ int lorawan_send(uint8_t port, uint8_t *data, uint8_t len,
 	}
 
 	/*
-	 * Always wait for MAC operations to complete.
-	 * We can be sure that the semaphore will be released for
-	 * both success and failure cases after a specific time period.
-	 * So we can use K_FOREVER and no need to check the return val.
+	 * Always wait for MAC operations to complete. LoRaMac reports both
+	 * success and failure once the transmission's RX windows have
+	 * closed; the bound only guards against a confirm that never comes
+	 * (which previously blocked the calling thread forever).
 	 */
-	k_sem_take(&mcps_confirm_sem, K_FOREVER);
+	if (k_sem_take(&mcps_confirm_sem, LORAWAN_CONFIRM_TIMEOUT) != 0) {
+		LOG_ERR("McpsConfirm timeout");
+		ret = -ETIMEDOUT;
+		goto out;
+	}
 	if (last_mcps_confirm_status != LORAMAC_EVENT_INFO_STATUS_OK) {
 		ret = lorawan_eventinfo2errno(last_mcps_confirm_status);
 	}
@@ -768,11 +855,14 @@ int lorawan_start(void)
 	GetPhyParams_t phy_params;
 	PhyParam_t phy_param;
 
+	lorawan_mac_lock();
+
 	status = LoRaMacInitialization(&mac_primitives, &mac_callbacks,
 				       selected_region);
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("LoRaMacInitialization failed: %s",
 			lorawan_status2str(status));
+		lorawan_mac_unlock();
 		return -EINVAL;
 	}
 
@@ -787,6 +877,7 @@ int lorawan_start(void)
 	if (status != LORAMAC_STATUS_OK) {
 		LOG_ERR("Failed to start the LoRaMAC stack: %s",
 			lorawan_status2str(status));
+		lorawan_mac_unlock();
 		return -EINVAL;
 	}
 
@@ -800,6 +891,8 @@ int lorawan_start(void)
 	mib_req.Type = MIB_SYSTEM_MAX_RX_ERROR;
 	mib_req.Param.SystemMaxRxError = CONFIG_LORAWAN_SYSTEM_MAX_RX_ERROR;
 	LoRaMacMibSetRequestConfirm(&mib_req);
+
+	lorawan_mac_unlock();
 
 	return 0;
 }

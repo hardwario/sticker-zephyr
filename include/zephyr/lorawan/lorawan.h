@@ -324,6 +324,18 @@ int lorawan_start(void);
 int lorawan_send(uint8_t port, uint8_t *data, uint8_t len, enum lorawan_message_type type);
 
 /**
+ * @brief Wait before the duty cycle admits a frame again
+ *
+ * After lorawan_send() returned -ECONNREFUSED (every band whose channels are
+ * enabled is out of duty-cycle credits), this is the time in milliseconds
+ * until the MAC has a band with credits again, as LoRaMac computed it. 0 after
+ * any other outcome of lorawan_send(), or when the MAC gave no wait.
+ *
+ * @return Wait in milliseconds
+ */
+uint32_t lorawan_get_duty_cycle_wait_ms(void);
+
+/**
  * @brief Set the current device class
  *
  * Change the current device class. This function may be called before
@@ -440,6 +452,17 @@ void lorawan_get_payload_sizes(uint8_t *max_next_payload_size,
 int lorawan_set_region(enum lorawan_region region);
 
 /**
+ * @brief Select a public or private LoRaWAN network
+ *
+ * Selects the LoRa sync word (public 0x34, private 0x12). It takes effect on
+ * the next lorawan_join(), which applies it before sending the join request.
+ * The default comes from CONFIG_LORAWAN_PUBLIC_NETWORK.
+ *
+ * @param enable true for a public network, false for a private one
+ */
+void lorawan_set_public_network(bool enable);
+
+/**
  * @brief Request for time according to DeviceTimeReq MAC cmd
  *
  * Append MAC DevTimeReq command. It will be processed on next send
@@ -538,6 +561,28 @@ void lorawan_frag_transport_register_descriptor_callback(transport_descriptor_cb
  * @return 0 if successful, negative errno otherwise.
  */
 int lorawan_frag_transport_run(void (*transport_finished_cb)(void));
+
+/**
+ * @brief Take the lock that serialises all access to the LoRaMac stack.
+ *
+ * LoRaMac-node is not thread-safe: requests come from application threads
+ * through this API, while its timer and radio events are processed on the
+ * system work queue. Every entry into the MAC therefore runs under one
+ * recursive lock. The LoRaWAN API and the loramac-node radio/timer glue take
+ * it internally; an application that calls LoRaMac functions directly (MIB
+ * get/set, LoRaMacIsBusy(), ...) must hold it around those calls as well.
+ *
+ * Never hold the lock while waiting for a MAC event (confirm, downlink): the
+ * event is delivered from a context that needs the lock.
+ *
+ * @note HARDWARIO sticker-zephyr extension (hardwario/sticker-firmware#241).
+ */
+void lorawan_mac_lock(void);
+
+/**
+ * @brief Release the lock taken by lorawan_mac_lock().
+ */
+void lorawan_mac_unlock(void);
 
 #ifdef __cplusplus
 }
